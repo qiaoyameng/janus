@@ -40,6 +40,21 @@ Each has two properties: ``sync_q`` and ``async_q``.
 Use the first to get synchronous interface and the second to get asynchronous
 one.
 
+Waiting on several asynchronous queues
+--------------------------------------
+
+``await janus.select_get(first.async_q, second.async_q)`` removes exactly one
+item from one queue and returns a ``(queue, item)`` pair. It neither optimistically
+fetches an item from every queue nor starts competing getters that must be
+cancelled.
+
+When more than one queue is ready, selection starts with the first supplied
+queue and rotates by one position for each subsequent successful selection on
+the same ordered set of queues. Empty queues that have been shut down are
+skipped;
+``janus.AsyncQueueShutDown`` is raised only when every supplied queue is shut
+down and drained. All queues must be bound to the running event loop.
+
 
 Example
 -------

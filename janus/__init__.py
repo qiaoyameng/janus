@@ -1,9 +1,11 @@
 import asyncio
 import sys
 import threading
+import weakref
 from asyncio import QueueEmpty as AsyncQueueEmpty
 from asyncio import QueueFull as AsyncQueueFull
 from collections import deque
+from contextlib import contextmanager
 from heapq import heappop, heappush
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
@@ -39,6 +41,7 @@ __all__ = (
     "AsyncQueueFull",
     "AsyncQueueShutDown",
     "BaseQueue",
+    "select_get",
 )
 
 
@@ -122,6 +125,7 @@ class Queue(Generic[T]):
         self._async_tasks_done_waiting = 0
 
         self._pending: deque[asyncio.Future[None]] = deque()
+        self._async_select_get_waiters: deque[asyncio.Future[None]] = deque()
 
         self._sync_queue = _SyncQueueProxy(self)
         self._async_queue = _AsyncQueueProxy(self)
@@ -170,6 +174,9 @@ class Queue(Generic[T]):
                 self._sync_not_full.notify_all()
             if self._async_not_empty_waiting:
                 self._notify_async(self._async_not_empty.notify_all)
+            self._notify_async_select_get_waiters(
+                len(self._async_select_get_waiters)
+            )
             if self._async_not_full_waiting:
                 self._notify_async(self._async_not_full.notify_all)
 
@@ -259,6 +266,49 @@ class Queue(Generic[T]):
             # async API is not available, nothing to notify
             return
         loop.call_soon_threadsafe(self._setup_async_notifier, loop, method)
+
+    def _notify_async_select_get_waiters(self, count: int) -> None:
+        # Warning!
+        # The function should be called when self._sync_mutex is locked,
+        # otherwise the code is not thread-safe
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+
+        while count > 0 and self._async_select_get_waiters:
+            future = self._async_select_get_waiters.popleft()
+            if not future.done():
+                loop.call_soon_threadsafe(_set_select_get_waiter_result, future)
+                count -= 1
+
+
+def _set_select_get_waiter_result(future: "asyncio.Future[None]") -> None:
+    if not future.done():
+        future.set_result(None)
+
+
+@contextmanager
+def _locked_queues(parents: list["Queue[object]"]):
+    ordered_parents = sorted(parents, key=id)
+    for parent in ordered_parents:
+        parent._sync_mutex.acquire()
+    try:
+        yield
+    finally:
+        for parent in reversed(ordered_parents):
+            parent._sync_mutex.release()
+
+
+_select_get_rotation_states = weakref.WeakKeyDictionary()
+
+
+def _select_get_rotation(parents: list["Queue[object]"]) -> int:
+    anchor = parents[0]
+    states = _select_get_rotation_states.setdefault(anchor, {})
+    key = tuple(weakref.ref(parent) for parent in parents)
+    rotation = states.get(key, 0)
+    states[key] = rotation + 1
+    return rotation % len(parents)
 
 
 class _SyncQueueProxy(SyncQueue[T]):
@@ -403,6 +453,8 @@ class _SyncQueueProxy(SyncQueue[T]):
                 parent._sync_not_empty.notify()
             if parent._async_not_empty_waiting:
                 parent._notify_async(parent._async_not_empty.notify)
+            if not parent._async_not_empty_waiting:
+                parent._notify_async_select_get_waiters(1)
 
     def get(self, block: bool = True, timeout: OptFloat = None) -> T:
         """Remove and return an item from the queue.
@@ -560,6 +612,8 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 parent._put_internal(item)
                 if parent._async_not_empty_waiting:
                     parent._async_not_empty.notify()
+                else:
+                    parent._notify_async_select_get_waiters(1)
                 if parent._sync_not_empty_waiting:
                     parent._sync_not_empty.notify()
 
@@ -580,6 +634,8 @@ class _AsyncQueueProxy(AsyncQueue[T]):
             parent._put_internal(item)
             if parent._async_not_empty_waiting:
                 parent._notify_async(parent._async_not_empty.notify)
+            else:
+                parent._notify_async_select_get_waiters(1)
             if parent._sync_not_empty_waiting:
                 parent._sync_not_empty.notify()
 
@@ -694,6 +750,108 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         for async one.
         """
         self._parent.shutdown(immediate)
+
+
+async def select_get(*queues: "AsyncQueue[T]") -> tuple["AsyncQueue[T]", T]:
+    """Wait for and remove one item from one of several asynchronous queues.
+
+    Return a ``(queue, item)`` pair. Queues are tried in the supplied order,
+    rotated by one position after every successful selection for the same
+    ordered set of queues. Thus the first selection starts at the first queue,
+    the second at the second queue, and so on cyclically.
+
+    All queues must belong to the running event loop. A queue that is shut
+    down and drained is ignored; ``AsyncQueueShutDown`` is raised only once
+    every queue has reached that terminal state.
+    """
+    if not queues:
+        raise ValueError("select_get() expected at least one queue")
+
+    loop = asyncio.get_running_loop()
+    parents: list[Queue[T]] = []
+    seen_ids: set[int] = set()
+
+    for queue in queues:
+        if not isinstance(queue, _AsyncQueueProxy):
+            raise TypeError("select_get() expects janus.AsyncQueue objects")
+        parent = queue._parent
+        if id(parent) in seen_ids:
+            raise ValueError("select_get() got the same queue more than once")
+        seen_ids.add(id(parent))
+        if parent._loop is not None and parent._loop is not loop:
+            raise RuntimeError(f"{parent!r} is bound to a different event loop")
+        parents.append(parent)
+
+    waiter: Optional[asyncio.Future[None]] = None
+
+    while True:
+        with _locked_queues(parents):
+            for parent in parents:
+                if parent._loop is not None and parent._loop is not loop:
+                    raise RuntimeError(
+                        f"{parent!r} is bound to a different event loop"
+                    )
+            for parent in parents:
+                if parent._loop is None:
+                    parent._loop = loop
+
+            if waiter is not None:
+                for parent in parents:
+                    try:
+                        parent._async_select_get_waiters.remove(waiter)
+                    except ValueError:
+                        pass
+
+            if any(parent._qsize() > 0 for parent in parents):
+                offset = _select_get_rotation(parents)
+                selected_parent = parents[0]
+                for index in range(len(parents)):
+                    selected_parent = parents[(offset + index) % len(parents)]
+                    if selected_parent._qsize() > 0:
+                        break
+
+                selected_queue = selected_parent._async_queue
+                item = selected_parent._get()
+                if selected_parent._async_not_full_waiting:
+                    selected_parent._notify_async(
+                        selected_parent._async_not_full.notify
+                    )
+                if selected_parent._sync_not_full_waiting:
+                    selected_parent._sync_not_full.notify()
+
+                if waiter is not None:
+                    for parent in parents:
+                        if parent is not selected_parent and parent._qsize() > 0:
+                            parent._notify_async_select_get_waiters(1)
+
+                return selected_queue, item
+
+            if all(
+                parent._is_shutdown and not parent._qsize()
+                for parent in parents
+            ):
+                raise AsyncQueueShutDown
+
+            waiter = loop.create_future()
+            for parent in parents:
+                if not (parent._is_shutdown and not parent._qsize()):
+                    parent._async_select_get_waiters.append(waiter)
+
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            with _locked_queues(parents):
+                notified_parents = []
+                for parent in parents:
+                    try:
+                        parent._async_select_get_waiters.remove(waiter)
+                    except ValueError:
+                        notified_parents.append(parent)
+
+                for parent in notified_parents:
+                    if parent._qsize() > 0:
+                        parent._notify_async_select_get_waiters(1)
+            raise
 
 
 class PriorityQueue(Queue[T]):
