@@ -4,7 +4,7 @@ import threading
 from asyncio import QueueEmpty as AsyncQueueEmpty
 from asyncio import QueueFull as AsyncQueueFull
 from collections import deque
-from heapq import heappop, heappush
+from heapq import heappop
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
 from time import monotonic
@@ -711,7 +711,32 @@ class PriorityQueue(Queue[T]):
         return len(self._heap_queue)
 
     def _put(self, item: T) -> None:
-        heappush(self._heap_queue, item)
+        heap = self._heap_queue
+        heap.append(item)
+        position = len(heap) - 1
+        moved_from: list[int] = []
+
+        try:
+            while position > 0:
+                parent_position = (position - 1) >> 1
+                if heap[position] < heap[parent_position]:
+                    moved_from.append(position)
+                    heap[position], heap[parent_position] = (
+                        heap[parent_position],
+                        heap[position],
+                    )
+                    position = parent_position
+                else:
+                    break
+        except BaseException:
+            for child_position in reversed(moved_from):
+                heap[position], heap[child_position] = (
+                    heap[child_position],
+                    heap[position],
+                )
+                position = child_position
+            heap.pop()
+            raise
 
     def _get(self) -> T:
         return heappop(self._heap_queue)
