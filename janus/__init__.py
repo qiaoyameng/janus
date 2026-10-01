@@ -4,7 +4,7 @@ import threading
 from asyncio import QueueEmpty as AsyncQueueEmpty
 from asyncio import QueueFull as AsyncQueueFull
 from collections import deque
-from heapq import heappop, heappush
+from heapq import heappop
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
 from time import monotonic
@@ -235,10 +235,6 @@ class Queue(Generic[T]):
     def _get(self) -> T:
         return self._queue.popleft()
 
-    def _put_internal(self, item: T) -> None:
-        self._put(item)
-        self._unfinished_tasks += 1
-
     async def _do_async_notifier(self, method: Callable[[], None]) -> None:
         async with self._async_mutex:
             method()
@@ -259,6 +255,17 @@ class Queue(Generic[T]):
             # async API is not available, nothing to notify
             return
         loop.call_soon_threadsafe(self._setup_async_notifier, loop, method)
+
+    def _notify_putters(self) -> None:
+        # Warning!
+        # The function should be called when self._sync_mutex is locked,
+        # otherwise the code is not thread-safe
+        if self._is_shutdown:
+            return
+        if self._sync_not_full_waiting:
+            self._sync_not_full.notify()
+        if self._async_not_full_waiting:
+            self._notify_async(self._async_not_full.notify)
 
 
 class _SyncQueueProxy(SyncQueue[T]):
@@ -398,7 +405,14 @@ class _SyncQueueProxy(SyncQueue[T]):
                             parent._sync_not_full_waiting -= 1
                         if parent._is_shutdown:
                             raise SyncQueueShutDown
-            parent._put_internal(item)
+            try:
+                parent._put(item)
+            except BaseException:
+                try:
+                    parent._notify_putters()
+                finally:
+                    raise
+            parent._unfinished_tasks += 1
             if parent._sync_not_empty_waiting:
                 parent._sync_not_empty.notify()
             if parent._async_not_empty_waiting:
@@ -557,7 +571,14 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                     if parent._is_shutdown:
                         raise AsyncQueueShutDown
 
-                parent._put_internal(item)
+                try:
+                    parent._put(item)
+                except BaseException:
+                    try:
+                        parent._notify_putters()
+                    finally:
+                        raise
+                parent._unfinished_tasks += 1
                 if parent._async_not_empty_waiting:
                     parent._async_not_empty.notify()
                 if parent._sync_not_empty_waiting:
@@ -577,7 +598,14 @@ class _AsyncQueueProxy(AsyncQueue[T]):
             if 0 < parent._maxsize <= parent._qsize():
                 raise AsyncQueueFull
 
-            parent._put_internal(item)
+            try:
+                parent._put(item)
+            except BaseException:
+                try:
+                    parent._notify_putters()
+                finally:
+                    raise
+            parent._unfinished_tasks += 1
             if parent._async_not_empty_waiting:
                 parent._notify_async(parent._async_not_empty.notify)
             if parent._sync_not_empty_waiting:
@@ -711,7 +739,27 @@ class PriorityQueue(Queue[T]):
         return len(self._heap_queue)
 
     def _put(self, item: T) -> None:
-        heappush(self._heap_queue, item)
+        heap = self._heap_queue
+        pos = len(heap)
+        heap.append(item)
+        moved = []
+
+        try:
+            while pos > 0:
+                parent_pos = (pos - 1) >> 1
+                parent = heap[parent_pos]
+                if item < parent:
+                    moved.append((pos, heap[pos]))
+                    heap[pos] = parent
+                    pos = parent_pos
+                else:
+                    break
+            heap[pos] = item
+        except BaseException:
+            for moved_pos, moved_item in reversed(moved):
+                heap[moved_pos] = moved_item
+            heap.pop()
+            raise
 
     def _get(self) -> T:
         return heappop(self._heap_queue)

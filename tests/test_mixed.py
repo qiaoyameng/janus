@@ -1,11 +1,34 @@
 import asyncio
 import sys
+import threading
 
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 import janus
+
+
+class PriorityItem:
+    def __init__(self, priority, label):
+        self.priority = priority
+        self.label = label
+
+    def __lt__(self, other):
+        return self.priority < other.priority
+
+
+class FailingPriorityItem(PriorityItem):
+    def __init__(self, fail_on_comparison):
+        super().__init__(0, "failing")
+        self.fail_on_comparison = fail_on_comparison
+        self.comparison_count = 0
+
+    def __lt__(self, other):
+        self.comparison_count += 1
+        if self.comparison_count == self.fail_on_comparison:
+            raise TypeError("priority comparison failed")
+        return super().__lt__(other)
 
 
 class TestMixedMode:
@@ -381,6 +404,133 @@ class TestMixedMode:
 
         await asyncio.gather(*tasks)
         assert q.sync_q.qsize() == 2
+        await q.aclose()
+
+    @pytest.mark.parametrize(
+        "failed_put",
+        [
+            "sync_put",
+            "sync_put_nowait",
+            "async_put",
+            "async_put_nowait",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_priority_queue_failed_put_is_atomic(self, failed_put):
+        q = janus.PriorityQueue()
+        existing_items = [
+            PriorityItem(1, "one"),
+            PriorityItem(2, "two"),
+            PriorityItem(3, "three"),
+            PriorityItem(4, "four"),
+        ]
+
+        for item in existing_items:
+            q.sync_q.put_nowait(item)
+
+        failing_item = FailingPriorityItem(fail_on_comparison=2)
+        with pytest.raises(TypeError, match="priority comparison failed"):
+            if failed_put == "sync_put":
+                q.sync_q.put(failing_item)
+            elif failed_put == "sync_put_nowait":
+                q.sync_q.put_nowait(failing_item)
+            elif failed_put == "async_put":
+                await q.async_q.put(failing_item)
+            else:
+                q.async_q.put_nowait(failing_item)
+
+        assert failing_item.comparison_count == 2
+        assert q.sync_q.qsize() == 4
+        assert q.async_q.qsize() == 4
+        assert q.sync_q.unfinished_tasks == 4
+        assert q.async_q.unfinished_tasks == 4
+        assert q._heap_queue == existing_items
+
+        new_items = [
+            PriorityItem(0, "zero"),
+            PriorityItem(5, "five"),
+            PriorityItem(-1, "negative-one"),
+        ]
+        expected_items = sorted(
+            existing_items + new_items, key=lambda item: item.priority
+        )
+        received_items = []
+
+        def produce():
+            for item in new_items:
+                q.sync_q.put(item)
+
+        async def consume():
+            while len(received_items) < len(expected_items):
+                item = await q.async_q.get()
+                received_items.append(item)
+                q.async_q.task_done()
+
+        producer = threading.Thread(target=produce)
+        consumer_task = asyncio.create_task(consume())
+
+        producer.start()
+        await asyncio.wait_for(q.async_q.join(), timeout=1)
+        producer.join()
+        await consumer_task
+
+        assert received_items == expected_items
+        assert q.sync_q.qsize() == 0
+        assert q.sync_q.unfinished_tasks == 0
+        await q.aclose()
+
+    @pytest.mark.asyncio
+    async def test_priority_queue_failed_blocked_put_releases_waiting_putter(self):
+        q = janus.PriorityQueue(maxsize=4)
+        existing_items = [
+            PriorityItem(1, "one"),
+            PriorityItem(2, "two"),
+            PriorityItem(3, "three"),
+            PriorityItem(4, "four"),
+        ]
+
+        for item in existing_items:
+            q.sync_q.put_nowait(item)
+
+        failing_item = FailingPriorityItem(fail_on_comparison=2)
+        replacement_item = PriorityItem(5, "five")
+        failure_raised = threading.Event()
+
+        def fail_put():
+            try:
+                q.sync_q.put(failing_item)
+            except TypeError:
+                failure_raised.set()
+
+        failing_thread = threading.Thread(target=fail_put)
+        failing_thread.start()
+        while q._sync_not_full_waiting != 1:
+            await asyncio.sleep(0.001)
+
+        await q.async_q.get()
+        deadline = asyncio.get_running_loop().time() + 1
+        while not failure_raised.is_set():
+            assert asyncio.get_running_loop().time() < deadline
+            failure_raised.wait(0.001)
+            await asyncio.sleep(0)
+        failing_thread.join()
+
+        producer = threading.Thread(target=q.sync_q.put, args=(replacement_item,))
+        producer.start()
+        while producer.is_alive():
+            assert asyncio.get_running_loop().time() < deadline
+            producer.join(0.001)
+            await asyncio.sleep(0)
+        assert q.sync_q.qsize() == 4
+        assert q.sync_q.unfinished_tasks == 5
+        assert q.sync_q.get_nowait().label == "two"
+        assert q.sync_q.get_nowait().label == "three"
+        assert q.sync_q.get_nowait().label == "four"
+        assert q.sync_q.get_nowait().label == "five"
+        for _ in range(4):
+            q.sync_q.task_done()
+        q.async_q.task_done()
+        await q.async_q.join()
         await q.aclose()
 
     @pytest.mark.asyncio
