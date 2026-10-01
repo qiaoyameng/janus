@@ -8,7 +8,7 @@ from heapq import heappop, heappush
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
 from time import monotonic
-from typing import Callable, Generic, Optional, Protocol, TypeVar
+from typing import Any, Callable, Generic, Optional, Protocol, TypeVar
 
 if sys.version_info >= (3, 13):
     from asyncio import QueueShutDown as AsyncQueueShutDown
@@ -38,12 +38,15 @@ __all__ = (
     "AsyncQueueEmpty",
     "AsyncQueueFull",
     "AsyncQueueShutDown",
+    "SyncQueueClaim",
+    "AsyncQueueClaim",
     "BaseQueue",
 )
 
 
 T = TypeVar("T")
 OptFloat = Optional[float]
+_UNCLAIMED = object()
 
 
 class BaseQueue(Protocol[T]):
@@ -79,6 +82,16 @@ class SyncQueue(BaseQueue[T], Protocol[T]):
 
     def join(self) -> None: ...
 
+    def claim(
+        self, block: bool = True, timeout: OptFloat = None
+    ) -> "SyncQueueClaim[T]": ...
+
+    def claim_nowait(self) -> "SyncQueueClaim[T]": ...
+
+    def get_context(
+        self, block: bool = True, timeout: OptFloat = None
+    ) -> "SyncQueueClaim[T]": ...
+
 
 class AsyncQueue(BaseQueue[T], Protocol[T]):
     async def put(self, item: T) -> None: ...
@@ -86,6 +99,12 @@ class AsyncQueue(BaseQueue[T], Protocol[T]):
     async def get(self) -> T: ...
 
     async def join(self) -> None: ...
+
+    def claim(self) -> "AsyncQueueClaim[T]": ...
+
+    def claim_nowait(self) -> "AsyncQueueClaim[T]": ...
+
+    def get_context(self) -> "AsyncQueueClaim[T]": ...
 
 
 class Queue(Generic[T]):
@@ -97,10 +116,12 @@ class Queue(Generic[T]):
 
         self._maxsize = maxsize
         self._is_shutdown = False
+        self._is_immediate_shutdown = False
 
         self._init(maxsize)
 
         self._unfinished_tasks = 0
+        self._active_claims = 0
 
         self._sync_mutex = threading.Lock()
         self._sync_not_empty = threading.Condition(self._sync_mutex)
@@ -154,15 +175,13 @@ class Queue(Generic[T]):
         with self._sync_mutex:
             self._is_shutdown = True
             if immediate:
+                self._is_immediate_shutdown = True
                 while self._qsize():
                     self._get()
                     if self._unfinished_tasks > 0:
                         self._unfinished_tasks -= 1
                 # release all blocked threads in `join()`
-                if self._sync_tasks_done_waiting:
-                    self._sync_tasks_done.notify_all()
-                if self._async_tasks_done_waiting:
-                    self._notify_async(self._async_tasks_done.notify_all)
+                self._notify_tasks_done()
             # All getters need to re-check queue-empty to raise ShutDown
             if self._sync_not_empty_waiting:
                 self._sync_not_empty.notify_all()
@@ -235,6 +254,71 @@ class Queue(Generic[T]):
     def _get(self) -> T:
         return self._queue.popleft()
 
+    def _put_back(self, item: T) -> None:
+        self._queue.appendleft(item)
+
+    def _is_full(self) -> bool:
+        return (
+            self._maxsize > 0
+            and self._qsize() + self._active_claims >= self._maxsize
+        )
+
+    def _notify_tasks_done(self) -> None:
+        if self._sync_tasks_done_waiting:
+            self._sync_tasks_done.notify_all()
+        if self._async_tasks_done_waiting:
+            self._notify_async(self._async_tasks_done.notify_all)
+
+    def _notify_not_empty(self) -> None:
+        if self._sync_not_empty_waiting:
+            self._sync_not_empty.notify()
+        if self._async_not_empty_waiting:
+            self._notify_async(self._async_not_empty.notify)
+
+    def _notify_not_full(self) -> None:
+        if self._sync_not_full_waiting:
+            self._sync_not_full.notify()
+        if self._async_not_full_waiting:
+            self._notify_async(self._async_not_full.notify)
+
+    def _task_done(self) -> None:
+        if self._unfinished_tasks == 0:
+            raise ValueError("task_done() called too many times")
+        if self._unfinished_tasks <= self._active_claims:
+            return
+        self._unfinished_tasks -= 1
+        if self._unfinished_tasks == 0:
+            self._notify_tasks_done()
+
+    def _claim_acquired(self) -> None:
+        self._active_claims += 1
+
+    def _finish_claim(self) -> None:
+        with self._sync_tasks_done:
+            self._active_claims -= 1
+            if self._unfinished_tasks > 0:
+                self._unfinished_tasks -= 1
+            if self._unfinished_tasks == 0:
+                self._notify_tasks_done()
+        with self._sync_not_full:
+            if self._sync_not_full_waiting:
+                self._sync_not_full.notify()
+            if self._async_not_full_waiting:
+                self._notify_async(self._async_not_full.notify)
+
+    def _release_claim(self, item: T) -> None:
+        with self._sync_mutex:
+            self._active_claims -= 1
+            if self._is_immediate_shutdown:
+                if self._unfinished_tasks > 0:
+                    self._unfinished_tasks -= 1
+                if self._unfinished_tasks == 0:
+                    self._notify_tasks_done()
+                self._notify_not_full()
+            else:
+                self._put_back(item)
+                self._notify_not_empty()
+
     def _put_internal(self, item: T) -> None:
         self._put(item)
         self._unfinished_tasks += 1
@@ -259,6 +343,96 @@ class Queue(Generic[T]):
             # async API is not available, nothing to notify
             return
         loop.call_soon_threadsafe(self._setup_async_notifier, loop, method)
+
+
+class SyncQueueClaim(Generic[T]):
+    """Synchronous context manager for an acquired queue entry."""
+
+    __slots__ = ("_queue", "_block", "_timeout", "_item", "_claimed")
+
+    def __init__(
+        self,
+        queue: "_SyncQueueProxy[T]",
+        block: bool = True,
+        timeout: OptFloat = None,
+        item: Any = _UNCLAIMED,
+    ):
+        self._queue = queue
+        self._block = block
+        self._timeout = timeout
+        self._item: Any = item
+        self._claimed = item is not _UNCLAIMED
+
+    @property
+    def item(self) -> T:
+        if self._item is _UNCLAIMED:
+            raise RuntimeError("claim has not been entered")
+        return self._item
+
+    def __enter__(self) -> T:
+        if not self._claimed:
+            self._item = self._queue._get_claim(self._block, self._timeout)
+            self._claimed = True
+        return self._item
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if not self._claimed:
+            return False
+        self._claimed = False
+        item = self._item
+        self._item = _UNCLAIMED
+        parent = self._queue._parent
+        if exc_type is None:
+            parent._finish_claim()
+        else:
+            parent._release_claim(item)
+        return False
+
+
+class AsyncQueueClaim(Generic[T]):
+    """Asynchronous context manager for an acquired queue entry."""
+
+    __slots__ = ("_queue", "_item", "_claimed")
+
+    def __init__(self, queue: "_AsyncQueueProxy[T]", item: Any = _UNCLAIMED):
+        self._queue = queue
+        self._item: Any = item
+        self._claimed = item is not _UNCLAIMED
+
+    @property
+    def item(self) -> T:
+        if self._item is _UNCLAIMED:
+            raise RuntimeError("claim has not been entered")
+        return self._item
+
+    async def acquire(self) -> T:
+        if not self._claimed:
+            self._item = await self._queue._get_claim()
+            self._claimed = True
+        return self._item
+
+    def __await__(self):
+        async def get_claim() -> "AsyncQueueClaim[T]":
+            await self.acquire()
+            return self
+
+        return get_claim().__await__()
+
+    async def __aenter__(self) -> T:
+        return await self.acquire()
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        if not self._claimed:
+            return False
+        self._claimed = False
+        item = self._item
+        self._item = _UNCLAIMED
+        parent = self._queue._parent
+        if exc_type is None:
+            parent._finish_claim()
+        else:
+            parent._release_claim(item)
+        return False
 
 
 class _SyncQueueProxy(SyncQueue[T]):
@@ -294,15 +468,7 @@ class _SyncQueueProxy(SyncQueue[T]):
         """
         parent = self._parent
         with parent._sync_tasks_done:
-            unfinished = parent._unfinished_tasks - 1
-            if unfinished <= 0:
-                if unfinished < 0:
-                    raise ValueError("task_done() called too many times")
-                if parent._sync_tasks_done_waiting:
-                    parent._sync_tasks_done.notify_all()
-                if parent._async_tasks_done_waiting:
-                    parent._notify_async(parent._async_tasks_done.notify_all)
-            parent._unfinished_tasks = unfinished
+            parent._task_done()
 
     def join(self) -> None:
         """Blocks until all items in the Queue have been gotten and processed.
@@ -315,12 +481,14 @@ class _SyncQueueProxy(SyncQueue[T]):
         """
         parent = self._parent
         with parent._sync_tasks_done:
-            while parent._unfinished_tasks:
-                parent._sync_tasks_done_waiting += 1
-                try:
-                    parent._sync_tasks_done.wait()
-                finally:
-                    parent._sync_tasks_done_waiting -= 1
+            parent._sync_tasks_done_waiting += 1
+            while parent._unfinished_tasks or parent._active_claims:
+                parent._sync_tasks_done.wait_for(
+                    lambda: not (
+                        parent._unfinished_tasks or parent._active_claims
+                    )
+                )
+            parent._sync_tasks_done_waiting -= 1
 
     def qsize(self) -> int:
         """Return the approximate size of the queue (not reliable!)."""
@@ -353,7 +521,10 @@ class _SyncQueueProxy(SyncQueue[T]):
         qsize() can be used.
         """
         parent = self._parent
-        return 0 < parent._maxsize <= parent._qsize()
+        return (
+            parent._maxsize > 0
+            and parent._qsize() + parent._active_claims >= parent._maxsize
+        )
 
     def put(self, item: T, block: bool = True, timeout: OptFloat = None) -> None:
         """Put an item into the queue.
@@ -372,10 +543,10 @@ class _SyncQueueProxy(SyncQueue[T]):
                 raise SyncQueueShutDown
             if parent._maxsize > 0:
                 if not block:
-                    if parent._qsize() >= parent._maxsize:
+                    if parent._is_full():
                         raise SyncQueueFull
                 elif timeout is None:
-                    while parent._qsize() >= parent._maxsize:
+                    while parent._is_full():
                         parent._sync_not_full_waiting += 1
                         try:
                             parent._sync_not_full.wait()
@@ -387,7 +558,7 @@ class _SyncQueueProxy(SyncQueue[T]):
                     raise ValueError("'timeout' must be a non-negative number")
                 else:
                     endtime = monotonic() + timeout
-                    while parent._qsize() >= parent._maxsize:
+                    while parent._is_full():
                         remaining = endtime - monotonic()
                         if remaining <= 0.0:
                             raise SyncQueueFull
@@ -469,6 +640,64 @@ class _SyncQueueProxy(SyncQueue[T]):
         """
         return self.get(block=False)
 
+    def claim(
+        self, block: bool = True, timeout: OptFloat = None
+    ) -> SyncQueueClaim[T]:
+        """Return a context manager that acquires and tracks one entry."""
+        return SyncQueueClaim(self, block, timeout)
+
+    def claim_nowait(self) -> SyncQueueClaim[T]:
+        """Immediately acquire an entry and return its tracking context."""
+        return SyncQueueClaim(self, item=self._get_claim(block=False))
+
+    def get_context(
+        self, block: bool = True, timeout: OptFloat = None
+    ) -> SyncQueueClaim[T]:
+        """Compatibility alias for :meth:`claim`."""
+        return self.claim(block, timeout)
+
+    def _get_claim(self, block: bool = True, timeout: OptFloat = None) -> T:
+        parent = self._parent
+        with parent._sync_not_empty:
+            if parent._is_immediate_shutdown or (
+                parent._is_shutdown and not parent._qsize()
+            ):
+                raise SyncQueueShutDown
+            if not block:
+                if not parent._qsize():
+                    raise SyncQueueEmpty
+            elif timeout is None:
+                while not parent._qsize():
+                    parent._sync_not_empty_waiting += 1
+                    try:
+                        parent._sync_not_empty.wait()
+                    finally:
+                        parent._sync_not_empty_waiting -= 1
+                    if parent._is_immediate_shutdown or (
+                        parent._is_shutdown and not parent._qsize()
+                    ):
+                        raise SyncQueueShutDown
+            elif timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number")
+            else:
+                endtime = monotonic() + timeout
+                while not parent._qsize():
+                    remaining = endtime - monotonic()
+                    if remaining <= 0.0:
+                        raise SyncQueueEmpty
+                    parent._sync_not_empty_waiting += 1
+                    try:
+                        parent._sync_not_empty.wait(remaining)
+                    finally:
+                        parent._sync_not_empty_waiting -= 1
+                    if parent._is_immediate_shutdown or (
+                        parent._is_shutdown and not parent._qsize()
+                    ):
+                        raise SyncQueueShutDown
+            item = parent._get()
+            parent._claim_acquired()
+            return item
+
     def shutdown(self, immediate: bool = False) -> None:
         """Shut-down the queue, making queue gets and puts raise an exception.
 
@@ -529,8 +758,9 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         parent = self._parent
         if parent._maxsize <= 0:
             return False
-        else:
-            return parent._qsize() >= parent._maxsize
+        return (
+            parent._qsize() + parent._active_claims >= parent._maxsize
+        )
 
     async def put(self, item: T) -> None:
         """Put an item into the queue.
@@ -546,7 +776,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 if parent._is_shutdown:
                     raise AsyncQueueShutDown
                 parent._get_loop()  # check the event loop
-                while 0 < parent._maxsize <= parent._qsize():
+                while parent._is_full():
                     parent._async_not_full_waiting += 1
                     parent._sync_mutex.release()
                     try:
@@ -574,7 +804,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 raise AsyncQueueShutDown
 
             parent._get_loop()
-            if 0 < parent._maxsize <= parent._qsize():
+            if parent._is_full():
                 raise AsyncQueueFull
 
             parent._put_internal(item)
@@ -634,6 +864,56 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 parent._sync_not_full.notify()
             return item
 
+    def claim(self) -> AsyncQueueClaim[T]:
+        """Return a context manager that acquires and tracks one entry."""
+        return AsyncQueueClaim(self)
+
+    def claim_nowait(self) -> AsyncQueueClaim[T]:
+        """Immediately acquire an entry and return its tracking context."""
+        parent = self._parent
+        with parent._sync_mutex:
+            parent._get_loop()
+            if parent._is_immediate_shutdown or (
+                parent._is_shutdown and not parent._qsize()
+            ):
+                raise AsyncQueueShutDown
+            if not parent._qsize():
+                raise AsyncQueueEmpty
+
+            return AsyncQueueClaim(self, self._get_claim_nowait_locked())
+
+    def get_context(self) -> AsyncQueueClaim[T]:
+        """Compatibility alias for :meth:`claim`."""
+        return self.claim()
+
+    def _get_claim_nowait_locked(self) -> T:
+        parent = self._parent
+        item = parent._get()
+        parent._claim_acquired()
+        return item
+
+    async def _get_claim(self) -> T:
+        parent = self._parent
+        async with parent._async_not_empty:
+            with parent._sync_mutex:
+                parent._get_loop()
+                while not parent._qsize():
+                    if parent._is_immediate_shutdown or parent._is_shutdown:
+                        raise AsyncQueueShutDown
+                    parent._async_not_empty_waiting += 1
+                    parent._sync_mutex.release()
+                    try:
+                        await parent._async_not_empty.wait()
+                    finally:
+                        parent._sync_mutex.acquire()
+                        parent._async_not_empty_waiting -= 1
+                if parent._is_immediate_shutdown:
+                    raise AsyncQueueShutDown
+
+                item = parent._get()
+                parent._claim_acquired()
+                return item
+
     def task_done(self) -> None:
         """Indicate that a formerly enqueued task is complete.
 
@@ -650,14 +930,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         """
         parent = self._parent
         with parent._sync_tasks_done:
-            if parent._unfinished_tasks <= 0:
-                raise ValueError("task_done() called too many times")
-            parent._unfinished_tasks -= 1
-            if parent._unfinished_tasks == 0:
-                if parent._async_tasks_done_waiting:
-                    parent._notify_async(parent._async_tasks_done.notify_all)
-                if parent._sync_tasks_done_waiting:
-                    parent._sync_tasks_done.notify_all()
+            parent._task_done()
 
     async def join(self) -> None:
         """Block until all items in the queue have been gotten and processed.
@@ -671,7 +944,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         async with parent._async_tasks_done:
             with parent._sync_mutex:
                 parent._get_loop()  # check the event loop
-                while parent._unfinished_tasks:
+                while parent._unfinished_tasks or parent._active_claims:
                     parent._async_tasks_done_waiting += 1
                     parent._sync_mutex.release()
                     try:
@@ -716,6 +989,9 @@ class PriorityQueue(Queue[T]):
     def _get(self) -> T:
         return heappop(self._heap_queue)
 
+    def _put_back(self, item: T) -> None:
+        heappush(self._heap_queue, item)
+
 
 class LifoQueue(Queue[T]):
     """Variant of Queue that retrieves most recently added entries first."""
@@ -728,3 +1004,6 @@ class LifoQueue(Queue[T]):
 
     def _get(self) -> T:
         return self._queue.pop()
+
+    def _put_back(self, item: T) -> None:
+        self._queue.append(item)

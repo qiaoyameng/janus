@@ -41,6 +41,27 @@ Use the first to get synchronous interface and the second to get asynchronous
 one.
 
 
+Claim contexts
+--------------
+
+``claim()`` provides a context manager around queue work. Normal exit marks the
+entry done; an exception (including asyncio cancellation) returns it to the
+front of the queue. The entry keeps its queue slot while being processed.
+
+.. code:: python
+
+    with sync_q.claim() as item:
+        process(item)
+
+    async with async_q.claim() as item:
+        await process(item)
+
+During an ordinary shutdown, a failed in-flight entry is still returned to the
+queue. After ``shutdown(immediate=True)``, an exception from the body discards
+the entry and marks it done; normal exit marks it done as usual. Existing
+``get()`` and ``task_done()`` usage continues to work.
+
+
 Example
 -------
 
