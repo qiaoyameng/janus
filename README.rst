@@ -75,6 +75,44 @@ Example
     asyncio.run(main())
 
 
+Claim contexts
+--------------
+
+Use ``claim()`` when processing an item should be acknowledged only after
+the handler returns successfully. The claimed item still occupies its queue
+slot, so bounded queues do not admit replacement work while it is in flight.
+
+A normal context exit calls ``task_done()``. If the handler raises, or an
+asynchronous handler is cancelled, the same item is returned to the queue and
+``unfinished_tasks`` is not decremented. Re-enqueueing does not wait for
+capacity.
+
+Sync threads use a regular context manager:
+
+.. code:: python
+
+    with queue.sync_q.claim() as item:
+        process_item(item)
+
+Async tasks use an asynchronous context manager:
+
+.. code:: python
+
+    async with queue.async_q.claim() as item:
+        await process_item(item)
+
+You do not need to call ``task_done()`` inside a claim context; the context
+owns that acknowledgment. If existing code calls it and the handler then
+fails, the claim is still requeued without prematurely unblocking ``join()``.
+
+After ``shutdown(immediate=False)``, an in-flight claim that exits with an
+exception is still requeued for a graceful drain. After
+``shutdown(immediate=True)`` (or ``close()``), queued and in-flight items are
+acknowledged for shutdown purposes; an in-flight claim is not requeued, even if
+its handler fails. Existing ``get()`` / ``task_done()`` workflows continue to
+work unchanged.
+
+
 Limitations
 ===========
 

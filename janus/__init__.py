@@ -4,11 +4,13 @@ import threading
 from asyncio import QueueEmpty as AsyncQueueEmpty
 from asyncio import QueueFull as AsyncQueueFull
 from collections import deque
+from contextvars import ContextVar, Token
 from heapq import heappop, heappush
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
 from time import monotonic
-from typing import Callable, Generic, Optional, Protocol, TypeVar
+from types import TracebackType
+from typing import Callable, Generic, Optional, Protocol, Type, TypeVar
 
 if sys.version_info >= (3, 13):
     from asyncio import QueueShutDown as AsyncQueueShutDown
@@ -77,6 +79,10 @@ class SyncQueue(BaseQueue[T], Protocol[T]):
 
     def get(self, block: bool = True, timeout: OptFloat = None) -> T: ...
 
+    def claim(
+        self, block: bool = True, timeout: OptFloat = None
+    ) -> "_SyncClaimContext[T]": ...
+
     def join(self) -> None: ...
 
 
@@ -85,7 +91,87 @@ class AsyncQueue(BaseQueue[T], Protocol[T]):
 
     async def get(self) -> T: ...
 
+    def claim(self) -> "_AsyncClaimContext[T]": ...
+
     async def join(self) -> None: ...
+
+
+class _SyncClaimContext(Generic[T]):
+    def __init__(
+        self,
+        queue: "_SyncQueueProxy[T]",
+        block: bool,
+        timeout: OptFloat,
+    ) -> None:
+        self._queue = queue
+        self._block = block
+        self._timeout = timeout
+        self._item: Optional[T] = None
+        self._active = False
+        self._previous_claim: Optional[_SyncClaimContext[T]] = None
+        self._parent = queue._parent
+
+    def __enter__(self) -> T:
+        parent = self._queue._parent
+        item = self._queue.get(self._block, self._timeout, _claim=True)
+        self._item = item
+        self._active = True
+        self._previous_claim = getattr(parent._sync_claim, "current", None)
+        parent._sync_claim.current = self
+        return item
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> bool:
+        if not self._active:
+            return False
+
+        item = self._item
+        assert item is not None
+        parent = self._queue._parent
+        parent._finish_claim(item, exc_value is not None)
+        self._active = False
+        if parent._sync_claim.current is self:
+            parent._sync_claim.current = self._previous_claim
+        return False
+
+
+class _AsyncClaimContext(Generic[T]):
+    def __init__(self, queue: "_AsyncQueueProxy[T]") -> None:
+        self._queue = queue
+        self._item: Optional[T] = None
+        self._active = False
+        self._claim_token: Optional[Token[Optional[_AsyncClaimContext[T]]]] = None
+
+    async def __aenter__(self) -> T:
+        parent = self._queue._parent
+        item = await self._queue.get(_claim=True)
+        self._item = item
+        self._active = True
+        self._claim_token = parent._async_claim.set(self)
+        return item
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> bool:
+        if not self._active:
+            return False
+
+        item = self._item
+        token = self._claim_token
+        assert item is not None
+        assert token is not None
+        parent = self._queue._parent
+        parent._finish_claim(item, exc_value is not None)
+        self._active = False
+        parent._async_claim.reset(token)
+        return False
 
 
 class Queue(Generic[T]):
@@ -97,10 +183,12 @@ class Queue(Generic[T]):
 
         self._maxsize = maxsize
         self._is_shutdown = False
+        self._is_immediate_shutdown = False
 
         self._init(maxsize)
 
         self._unfinished_tasks = 0
+        self._claimed_tasks = 0
 
         self._sync_mutex = threading.Lock()
         self._sync_not_empty = threading.Condition(self._sync_mutex)
@@ -122,6 +210,11 @@ class Queue(Generic[T]):
         self._async_tasks_done_waiting = 0
 
         self._pending: deque[asyncio.Future[None]] = deque()
+
+        self._sync_claim = threading.local()
+        self._async_claim: ContextVar[Optional[_AsyncClaimContext[T]]] = ContextVar(
+            "janus_async_claim", default=None
+        )
 
         self._sync_queue = _SyncQueueProxy(self)
         self._async_queue = _AsyncQueueProxy(self)
@@ -154,15 +247,16 @@ class Queue(Generic[T]):
         with self._sync_mutex:
             self._is_shutdown = True
             if immediate:
+                self._is_immediate_shutdown = True
                 while self._qsize():
                     self._get()
                     if self._unfinished_tasks > 0:
                         self._unfinished_tasks -= 1
+                if self._claimed_tasks and self._unfinished_tasks > 0:
+                    decrement = min(self._claimed_tasks, self._unfinished_tasks)
+                    self._unfinished_tasks -= decrement
                 # release all blocked threads in `join()`
-                if self._sync_tasks_done_waiting:
-                    self._sync_tasks_done.notify_all()
-                if self._async_tasks_done_waiting:
-                    self._notify_async(self._async_tasks_done.notify_all)
+                self._notify_tasks_done()
             # All getters need to re-check queue-empty to raise ShutDown
             if self._sync_not_empty_waiting:
                 self._sync_not_empty.notify_all()
@@ -235,6 +329,44 @@ class Queue(Generic[T]):
     def _get(self) -> T:
         return self._queue.popleft()
 
+    def _requeue(self, item: T) -> None:
+        self._put(item)
+
+    def _occupied_tasks(self) -> int:
+        return self._qsize() + self._claimed_tasks
+
+    def _notify_tasks_done(self) -> None:
+        if self._unfinished_tasks == 0:
+            if self._sync_tasks_done_waiting:
+                self._sync_tasks_done.notify_all()
+            if self._async_tasks_done_waiting:
+                self._notify_async(self._async_tasks_done.notify_all)
+
+    def _notify_not_full(self) -> None:
+        if self._sync_not_full_waiting:
+            self._sync_not_full.notify_all()
+        if self._async_not_full_waiting:
+            self._notify_async(self._async_not_full.notify_all)
+
+    def _notify_not_empty(self) -> None:
+        if self._sync_not_empty_waiting:
+            self._sync_not_empty.notify_all()
+        if self._async_not_empty_waiting:
+            self._notify_async(self._async_not_empty.notify_all)
+
+    def _finish_claim(self, item: T, failed: bool) -> None:
+        with self._sync_mutex:
+            self._claimed_tasks -= 1
+
+            if failed and not self._is_immediate_shutdown:
+                self._requeue(item)
+                self._notify_not_empty()
+            else:
+                if self._unfinished_tasks > 0:
+                    self._unfinished_tasks -= 1
+                self._notify_tasks_done()
+                self._notify_not_full()
+
     def _put_internal(self, item: T) -> None:
         self._put(item)
         self._unfinished_tasks += 1
@@ -293,6 +425,10 @@ class _SyncQueueProxy(SyncQueue[T]):
         placed in the queue.
         """
         parent = self._parent
+        claim = getattr(parent._sync_claim, "current", None)
+        if claim is not None and claim._active and claim._parent is parent:
+            return
+
         with parent._sync_tasks_done:
             unfinished = parent._unfinished_tasks - 1
             if unfinished <= 0:
@@ -353,7 +489,13 @@ class _SyncQueueProxy(SyncQueue[T]):
         qsize() can be used.
         """
         parent = self._parent
-        return 0 < parent._maxsize <= parent._qsize()
+        return 0 < parent._maxsize <= parent._occupied_tasks()
+
+    def claim(
+        self, block: bool = True, timeout: OptFloat = None
+    ) -> _SyncClaimContext[T]:
+        """Return a context manager that claims and acknowledges an item."""
+        return _SyncClaimContext(self, block, timeout)
 
     def put(self, item: T, block: bool = True, timeout: OptFloat = None) -> None:
         """Put an item into the queue.
@@ -372,10 +514,10 @@ class _SyncQueueProxy(SyncQueue[T]):
                 raise SyncQueueShutDown
             if parent._maxsize > 0:
                 if not block:
-                    if parent._qsize() >= parent._maxsize:
+                    if parent._occupied_tasks() >= parent._maxsize:
                         raise SyncQueueFull
                 elif timeout is None:
-                    while parent._qsize() >= parent._maxsize:
+                    while parent._occupied_tasks() >= parent._maxsize:
                         parent._sync_not_full_waiting += 1
                         try:
                             parent._sync_not_full.wait()
@@ -387,7 +529,7 @@ class _SyncQueueProxy(SyncQueue[T]):
                     raise ValueError("'timeout' must be a non-negative number")
                 else:
                     endtime = monotonic() + timeout
-                    while parent._qsize() >= parent._maxsize:
+                    while parent._occupied_tasks() >= parent._maxsize:
                         remaining = endtime - monotonic()
                         if remaining <= 0.0:
                             raise SyncQueueFull
@@ -404,7 +546,9 @@ class _SyncQueueProxy(SyncQueue[T]):
             if parent._async_not_empty_waiting:
                 parent._notify_async(parent._async_not_empty.notify)
 
-    def get(self, block: bool = True, timeout: OptFloat = None) -> T:
+    def get(
+        self, block: bool = True, timeout: OptFloat = None, _claim: bool = False
+    ) -> T:
         """Remove and return an item from the queue.
 
         If optional args 'block' is true and 'timeout' is None (the default),
@@ -447,10 +591,13 @@ class _SyncQueueProxy(SyncQueue[T]):
                     if parent._is_shutdown and not parent._qsize():
                         raise SyncQueueShutDown
             item = parent._get()
-            if parent._sync_not_full_waiting:
-                parent._sync_not_full.notify()
-            if parent._async_not_full_waiting:
-                parent._notify_async(parent._async_not_full.notify)
+            if _claim:
+                parent._claimed_tasks += 1
+            else:
+                if parent._sync_not_full_waiting:
+                    parent._sync_not_full.notify()
+                if parent._async_not_full_waiting:
+                    parent._notify_async(parent._async_not_full.notify)
             return item
 
     def put_nowait(self, item: T) -> None:
@@ -530,7 +677,11 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         if parent._maxsize <= 0:
             return False
         else:
-            return parent._qsize() >= parent._maxsize
+            return parent._occupied_tasks() >= parent._maxsize
+
+    def claim(self) -> _AsyncClaimContext[T]:
+        """Return an async context manager that claims and acknowledges an item."""
+        return _AsyncClaimContext(self)
 
     async def put(self, item: T) -> None:
         """Put an item into the queue.
@@ -546,7 +697,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 if parent._is_shutdown:
                     raise AsyncQueueShutDown
                 parent._get_loop()  # check the event loop
-                while 0 < parent._maxsize <= parent._qsize():
+                while 0 < parent._maxsize <= parent._occupied_tasks():
                     parent._async_not_full_waiting += 1
                     parent._sync_mutex.release()
                     try:
@@ -574,7 +725,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 raise AsyncQueueShutDown
 
             parent._get_loop()
-            if 0 < parent._maxsize <= parent._qsize():
+            if 0 < parent._maxsize <= parent._occupied_tasks():
                 raise AsyncQueueFull
 
             parent._put_internal(item)
@@ -583,7 +734,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
             if parent._sync_not_empty_waiting:
                 parent._sync_not_empty.notify()
 
-    async def get(self) -> T:
+    async def get(self, _claim: bool = False) -> T:
         """Remove and return an item from the queue.
 
         If queue is empty, wait until an item is available.
@@ -608,10 +759,13 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                         raise AsyncQueueShutDown
 
                 item = parent._get()
-                if parent._async_not_full_waiting:
-                    parent._async_not_full.notify()
-                if parent._sync_not_full_waiting:
-                    parent._sync_not_full.notify()
+                if _claim:
+                    parent._claimed_tasks += 1
+                else:
+                    if parent._async_not_full_waiting:
+                        parent._async_not_full.notify()
+                    if parent._sync_not_full_waiting:
+                        parent._sync_not_full.notify()
                 return item
 
     def get_nowait(self) -> T:
@@ -649,6 +803,10 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         the queue.
         """
         parent = self._parent
+        claim = parent._async_claim.get()
+        if claim is not None and claim._active:
+            return
+
         with parent._sync_tasks_done:
             if parent._unfinished_tasks <= 0:
                 raise ValueError("task_done() called too many times")

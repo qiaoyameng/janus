@@ -1,4 +1,5 @@
 import asyncio
+import queue
 import sys
 
 from concurrent.futures import ThreadPoolExecutor
@@ -398,3 +399,228 @@ class TestMixedMode:
 
         with pytest.raises(janus.AsyncQueueShutDown):
             await task
+
+
+class TestClaimContexts:
+    @pytest.mark.asyncio
+    async def test_sync_claim_acknowledges_on_normal_exit(self):
+        q = janus.Queue()
+        q.sync_q.put_nowait("item")
+
+        with q.sync_q.claim() as item:
+            assert item == "item"
+            assert q.sync_q.qsize() == 0
+            assert q.sync_q.unfinished_tasks == 1
+
+        assert q.sync_q.qsize() == 0
+        assert q.sync_q.unfinished_tasks == 0
+        await q.aclose()
+
+    @pytest.mark.asyncio
+    async def test_sync_claim_requeues_on_exception_without_losing_count(self):
+        q = janus.Queue()
+        q.sync_q.put_nowait("item")
+
+        with pytest.raises(RuntimeError):
+            with q.sync_q.claim() as item:
+                assert item == "item"
+                q.sync_q.task_done()
+                assert q.sync_q.unfinished_tasks == 1
+                raise RuntimeError("boom")
+
+        assert q.sync_q.get_nowait() == "item"
+        assert q.sync_q.unfinished_tasks == 1
+        await q.aclose()
+
+    @pytest.mark.asyncio
+    async def test_sync_failure_keeps_both_joins_waiting_after_task_done(self):
+        loop = asyncio.get_running_loop()
+        q = janus.Queue()
+        q.sync_q.put_nowait("record")
+
+        with ThreadPoolExecutor(2) as executor:
+            sync_join = loop.run_in_executor(executor, q.sync_q.join)
+            async_join = asyncio.create_task(q.async_q.join())
+            await asyncio.sleep(0.01)
+
+            def fail_once():
+                with pytest.raises(RuntimeError):
+                    with q.sync_q.claim() as item:
+                        assert item == "record"
+                        q.sync_q.task_done()
+                        assert q.sync_q.unfinished_tasks == 1
+                        raise RuntimeError("boom")
+
+            await loop.run_in_executor(executor, fail_once)
+            assert q.sync_q.qsize() == 1
+            assert q.sync_q.unfinished_tasks == 1
+            assert not sync_join.done()
+            assert not async_join.done()
+
+            async with q.async_q.claim():
+                pass
+
+            await asyncio.sleep(0.01)
+            await sync_join
+            await async_join
+
+        await q.aclose()
+
+    @pytest.mark.asyncio
+    async def test_async_claim_retries_until_success_for_both_joins(self):
+        loop = asyncio.get_running_loop()
+        q = janus.Queue()
+        record = object()
+        q.async_q.put_nowait(record)
+        observed = []
+
+        with ThreadPoolExecutor(1) as executor:
+            sync_join = loop.run_in_executor(executor, q.sync_q.join)
+            async_join = asyncio.create_task(q.async_q.join())
+            await asyncio.sleep(0)
+
+            async def fail_twice():
+                for attempt in range(2):
+                    with pytest.raises(RuntimeError):
+                        async with q.async_q.claim() as item:
+                            observed.append(item)
+                            assert item is record
+                            assert q.async_q.unfinished_tasks == 1
+                            raise RuntimeError(f"failure {attempt}")
+                    assert q.async_q.qsize() == 1
+                    await asyncio.sleep(0)
+                    assert not sync_join.done()
+                    assert not async_join.done()
+
+            await fail_twice()
+
+            async with q.async_q.claim() as item:
+                assert item is record
+            await asyncio.sleep(0.01)
+            await sync_join
+            await async_join
+
+        assert len(observed) == 2
+        assert q.async_q.unfinished_tasks == 0
+        await q.aclose()
+
+    @pytest.mark.asyncio
+    async def test_claim_keeps_capacity_until_context_exits(self):
+        q = janus.Queue(maxsize=1)
+        q.sync_q.put_nowait("item")
+
+        with pytest.raises(RuntimeError):
+            with q.sync_q.claim():
+                raise RuntimeError("retry")
+
+        assert q.sync_q.qsize() == 1
+        assert q.sync_q.full()
+        with pytest.raises(queue.Full):
+            q.sync_q.put_nowait("other")
+
+        with q.sync_q.claim():
+            assert q.sync_q.full()
+
+        assert not q.sync_q.full()
+        await q.aclose()
+
+    @pytest.mark.asyncio
+    async def test_async_claim_releases_capacity_on_success(self):
+        q = janus.Queue(maxsize=1)
+        q.async_q.put_nowait("item")
+        putter = asyncio.create_task(q.async_q.put("other"))
+
+        async with q.async_q.claim():
+            await asyncio.sleep(0)
+            assert not putter.done()
+
+        await putter
+        assert q.async_q.qsize() == 1
+        assert q.async_q.get_nowait() == "other"
+        await q.aclose()
+
+    @pytest.mark.asyncio
+    async def test_async_claim_requeues_when_cancelled(self):
+        q = janus.Queue()
+        q.async_q.put_nowait("item")
+
+        async def worker(ready):
+            async with q.async_q.claim() as item:
+                ready.set()
+                await asyncio.Event().wait()
+                return item
+
+        ready = asyncio.Event()
+        task = asyncio.create_task(worker(ready))
+        await ready.wait()
+        assert q.async_q.unfinished_tasks == 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert q.async_q.get_nowait() == "item"
+        assert q.async_q.unfinished_tasks == 1
+        await q.aclose()
+
+    @pytest.mark.asyncio
+    async def test_graceful_shutdown_requeues_in_flight_failure(self):
+        q = janus.Queue()
+        q.sync_q.put_nowait("item")
+        context = q.sync_q.claim()
+
+        with pytest.raises(RuntimeError):
+            with context as item:
+                q.shutdown(immediate=False)
+                assert item == "item"
+                raise RuntimeError("boom")
+
+        assert q.sync_q.qsize() == 1
+        assert q.sync_q.get_nowait() == "item"
+        assert q.sync_q.unfinished_tasks == 1
+        q.sync_q.task_done()
+        await q.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_immediate_shutdown_completes_in_flight_claim_without_duplicate(self):
+        q = janus.Queue()
+        q.sync_q.put_nowait("item")
+        context = q.sync_q.claim()
+
+        with context as item:
+            q.shutdown(immediate=True)
+            assert item == "item"
+
+        assert q.sync_q.qsize() == 0
+        assert q.sync_q.unfinished_tasks == 0
+        await q.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_immediate_shutdown_failure_has_no_duplicate_record(self):
+        q = janus.Queue()
+        q.sync_q.put_nowait("item")
+        context = q.sync_q.claim()
+
+        with pytest.raises(RuntimeError):
+            with context as item:
+                q.shutdown(immediate=True)
+                assert item == "item"
+                raise RuntimeError("boom")
+
+        assert q.sync_q.qsize() == 0
+        assert q.sync_q.unfinished_tasks == 0
+        await q.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_repeated_context_exit_is_idempotent(self):
+        q = janus.Queue()
+        q.sync_q.put_nowait("item")
+        context = q.sync_q.claim()
+
+        with context:
+            pass
+        context.__exit__(None, None, None)
+
+        assert q.sync_q.qsize() == 0
+        assert q.sync_q.unfinished_tasks == 0
+        await q.aclose()
