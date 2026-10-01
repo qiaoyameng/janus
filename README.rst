@@ -75,6 +75,22 @@ Example
     asyncio.run(main())
 
 
+Waiting on several queues
+-------------------------
+
+Use ``select_get()`` to consume one item from whichever async queue becomes
+ready first:
+
+.. code:: python
+
+    queue, item = await janus.select_get(alerts.async_q, tasks.async_q)
+
+Only the selected queue loses an item. If several queues are ready, the next
+call starts after the previously selected queue. A queue that is shut down is
+skipped after it has drained; ``janus.AsyncQueueShutDown`` is raised only when
+every supplied queue has reached that state.
+
+
 Limitations
 ===========
 

@@ -8,7 +8,7 @@ from heapq import heappop, heappush
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
 from time import monotonic
-from typing import Callable, Generic, Optional, Protocol, TypeVar
+from typing import Callable, Generic, Optional, Protocol, Tuple, TypeVar
 
 if sys.version_info >= (3, 13):
     from asyncio import QueueShutDown as AsyncQueueShutDown
@@ -39,6 +39,7 @@ __all__ = (
     "AsyncQueueFull",
     "AsyncQueueShutDown",
     "BaseQueue",
+    "select_get",
 )
 
 
@@ -85,6 +86,10 @@ class AsyncQueue(BaseQueue[T], Protocol[T]):
 
     async def get(self) -> T: ...
 
+    async def select_get(
+        self, *queues: "AsyncQueue[T]"
+    ) -> Tuple["AsyncQueue[T]", T]: ...
+
     async def join(self) -> None: ...
 
 
@@ -101,6 +106,7 @@ class Queue(Generic[T]):
         self._init(maxsize)
 
         self._unfinished_tasks = 0
+        self._select_get_turn = 0
 
         self._sync_mutex = threading.Lock()
         self._sync_not_empty = threading.Condition(self._sync_mutex)
@@ -614,6 +620,12 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                     parent._sync_not_full.notify()
                 return item
 
+    async def select_get(
+        self, *queues: "AsyncQueue[T]"
+    ) -> Tuple["AsyncQueue[T]", T]:
+        """Wait for and get one item from one of several queues."""
+        return await select_get(self, *queues)
+
     def get_nowait(self) -> T:
         """Remove and return an item from the queue.
 
@@ -694,6 +706,152 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         for async one.
         """
         self._parent.shutdown(immediate)
+
+
+async def _select_get_waiter(
+    queue: "_AsyncQueueProxy[T]", registered: "asyncio.Future[bool]"
+) -> bool:
+    parent = queue._parent
+    try:
+        async with parent._async_not_empty:
+            with parent._sync_mutex:
+                parent._get_loop()
+                should_wait = not parent._qsize() and not parent._is_shutdown
+                if not registered.done():
+                    registered.set_result(should_wait)
+
+                while not parent._qsize() and not parent._is_shutdown:
+                    parent._async_not_empty_waiting += 1
+                    parent._sync_mutex.release()
+                    try:
+                        await parent._async_not_empty.wait()
+                    finally:
+                        parent._sync_mutex.acquire()
+                        parent._async_not_empty_waiting -= 1
+
+                return bool(parent._qsize())
+    except BaseException as exc:
+        if not registered.done():
+            if isinstance(exc, asyncio.CancelledError):
+                registered.cancel()
+            else:
+                registered.set_exception(exc)
+        raise
+
+
+async def _cancel_select_get_waiters(
+    tasks: "list[asyncio.Task[bool]]",
+) -> None:
+    loop = asyncio.get_running_loop()
+
+    async def collect_waiters() -> "list[object]":
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+
+    cleanup = loop.create_task(collect_waiters())
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+
+    for result in cleanup.result():
+        if isinstance(result, BaseException) and not isinstance(
+            result, asyncio.CancelledError
+        ):
+            raise result
+
+
+async def select_get(*queues: "AsyncQueue[T]") -> Tuple["AsyncQueue[T]", T]:
+    """Wait for one item from any of the supplied async queues.
+
+    Return a ``(queue, item)`` tuple. At most one item is removed, and it is
+    removed from the selected queue only.
+
+    When more than one queue is ready, selection rotates after each successful
+    call: the first call starts at ``queues[0]``, and later calls start after
+    the queue selected by the previous call. Queues which are shut down and
+    empty are skipped until every queue reaches that state, at which point
+    ``AsyncQueueShutDown`` is raised.
+    """
+    if not queues:
+        raise ValueError("select_get() requires at least one queue")
+
+    loop = asyncio.get_running_loop()
+    parents = []
+    seen = set()
+    for queue in queues:
+        if not isinstance(queue, _AsyncQueueProxy):
+            raise TypeError("select_get() only accepts janus.AsyncQueue objects")
+        parent = queue._parent
+        if parent in seen:
+            raise ValueError("select_get() got the same queue more than once")
+        seen.add(parent)
+        parents.append(parent)
+
+    for parent in parents:
+        with parent._sync_mutex:
+            bound_loop = parent._loop
+            if bound_loop is not None and bound_loop is not loop:
+                raise RuntimeError(
+                    "select_get() only accepts queues bound to the same event loop"
+                )
+
+    while True:
+        registered = [loop.create_future() for _ in queues]
+        tasks = [
+            loop.create_task(_select_get_waiter(queue, future))
+            for queue, future in zip(queues, registered)
+        ]
+
+        try:
+            should_wait = await asyncio.gather(*registered)
+            item_ready = any(
+                task.result()
+                for task, active in zip(tasks, should_wait)
+                if not active
+            )
+            if not item_ready:
+                waiting = [
+                    task for task, active in zip(tasks, should_wait) if active
+                ]
+                while waiting:
+                    done, _ = await asyncio.wait(
+                        waiting, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if any(task.result() for task in done):
+                        break
+                    waiting = [task for task in waiting if not task.done()]
+        finally:
+            await _cancel_select_get_waiters(tasks)
+
+        anchor = queues[0]._parent
+        start = anchor._select_get_turn % len(queues)
+        all_terminated = True
+        current_task = asyncio.current_task()
+
+        for offset in range(len(queues)):
+            index = (start + offset) % len(queues)
+            queue = queues[index]
+            if getattr(current_task, "cancelling", lambda: 0)() or getattr(
+                current_task, "_must_cancel", False
+            ):
+                raise asyncio.CancelledError
+            try:
+                item = queue.get_nowait()
+            except AsyncQueueShutDown:
+                continue
+            except AsyncQueueEmpty:
+                all_terminated = False
+            else:
+                anchor._select_get_turn = (index + 1) % len(queues)
+                return queue, item
+
+        if all_terminated:
+            raise AsyncQueueShutDown
 
 
 class PriorityQueue(Queue[T]):
