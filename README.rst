@@ -40,6 +40,35 @@ Each has two properties: ``sync_q`` and ``async_q``.
 Use the first to get synchronous interface and the second to get asynchronous
 one.
 
+Weight budgets
+--------------
+
+``maxsize`` limits the number of queued items. For objects with very
+different sizes, ``Queue`` also accepts a ``weight`` callback and a
+``max_weight`` budget:
+
+.. code:: python
+
+    queue = janus.Queue(maxsize=1000, weight=len, max_weight=64 * 1024 * 1024)
+
+The callback runs once before an item is admitted and the integer result is
+saved with the entry; mutating the object later does not change its reserved
+weight. Weights must be non-negative integers and an item heavier than
+``max_weight`` raises ``ValueError`` immediately. Both item count and weight
+must fit before enqueueing.
+
+Blocking synchronous and asynchronous puts share one FIFO waiting queue.
+Consequently, a large item that is waiting for capacity prevents later small
+items from overtaking it, even if one of those small items would currently
+fit. Cancelling or timing out a waiter reserves no weight.
+
+Capacity is released by a successful ``get()``. A graceful shutdown keeps
+already queued items until they are consumed, while
+``shutdown(immediate=True)``/``close()`` discards remaining entries and
+releases their whole weight immediately. The current and remaining budgets
+are available through ``current_weight`` and ``free_weight`` on either
+``sync_q`` or ``async_q``.
+
 
 Example
 -------
