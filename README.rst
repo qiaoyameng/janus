@@ -75,6 +75,31 @@ Example
     asyncio.run(main())
 
 
+Batch operations
+----------------
+
+Both interfaces also support ``put_many()``/``get_many()`` to hand over a
+batch of records as a single queue operation, so a consumer never observes
+half of a batch:
+
+.. code:: python
+
+    # producer side: the whole batch is enqueued atomically or not at all
+    sync_q.put_many([rec1, rec2, rec3])  # waits until the whole batch fits
+
+    # consumer side: wait for at least 2 records, take at most 4
+    batch = await async_q.get_many(2, 4)
+    for record in batch:
+        async_q.task_done()  # still one task_done() per record
+
+``put_many()`` accepts only bounded sequences (with a known length) and
+never inserts a partial batch.  ``get_many()`` takes a batch only once at
+least ``min_items`` records are available; on a shut down queue it raises
+``QueueShutDown`` for a missing tail batch unless ``allow_partial=True``
+is passed.  See ``examples/batch_handoff.py`` for a full mixed
+thread/coroutine example.
+
+
 Limitations
 ===========
 
