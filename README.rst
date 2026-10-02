@@ -40,6 +40,40 @@ Each has two properties: ``sync_q`` and ``async_q``.
 Use the first to get synchronous interface and the second to get asynchronous
 one.
 
+Weight budget
+-------------
+
+In addition to the ``maxsize`` item count limit, a queue can be created
+with an optional total *weight* budget to bound the queued data volume
+(e.g. bytes of pending payloads) instead of just the number of entries:
+
+.. code:: python
+
+    queue = janus.Queue(maxsize=100,
+                        max_weight=16 * 1024 * 1024,
+                        weight=lambda item: item.nbytes)
+
+* ``weight`` must be a callable returning a non-negative finite number;
+  it is required if and only if ``max_weight`` is set.
+* The weight of an item is computed exactly once, before the item is
+  enqueued, and is stored along with it.  Mutating the item afterwards
+  does not change the accounting.
+* A weight function that raises, returns a non-number, or returns a
+  negative/NaN/infinite value makes the ``put`` call fail immediately;
+  an item heavier than the whole budget is rejected immediately as well.
+  Nothing is enqueued and no budget is consumed in these cases.
+* Both limits apply at the same time and are shared by the sync and async
+  APIs: a put proceeds only when both the item count and the total weight
+  fit.  The current usage is exposed as ``current_weight`` on the queue
+  and on both queue faces, the configured budget as ``max_weight``.
+* Budget is consumed only by a successful enqueue.  A blocked put does
+  not reserve budget, so cancelling or timing out a waiting put never
+  consumes budget, and a later smaller item that fits may overtake a
+  blocked bigger one.
+* Budget is released when an item leaves the queue: by a ``get`` (both
+  APIs, blocking or not), by draining the remaining items after a
+  graceful ``shutdown()``, or all at once by ``shutdown(immediate=True)``
+  / ``close()``.  ``task_done()`` does not affect the budget.
 
 Example
 -------

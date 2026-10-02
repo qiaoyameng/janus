@@ -1,4 +1,5 @@
 import asyncio
+import math
 import sys
 import threading
 from asyncio import QueueEmpty as AsyncQueueEmpty
@@ -51,6 +52,12 @@ class BaseQueue(Protocol[T]):
     def maxsize(self) -> int: ...
 
     @property
+    def max_weight(self) -> OptFloat: ...
+
+    @property
+    def current_weight(self) -> float: ...
+
+    @property
     def closed(self) -> bool: ...
 
     def task_done(self) -> None: ...
@@ -91,12 +98,42 @@ class AsyncQueue(BaseQueue[T], Protocol[T]):
 class Queue(Generic[T]):
     _loop: Optional[asyncio.AbstractEventLoop] = None
 
-    def __init__(self, maxsize: int = 0) -> None:
+    def __init__(
+        self,
+        maxsize: int = 0,
+        *,
+        max_weight: OptFloat = None,
+        weight: Optional[Callable[[T], float]] = None,
+    ) -> None:
         if sys.version_info < (3, 10):
             self._loop = asyncio.get_running_loop()
 
         self._maxsize = maxsize
         self._is_shutdown = False
+
+        if max_weight is None:
+            if weight is not None:
+                raise ValueError(
+                    "a weight function has no effect without max_weight"
+                )
+            self._max_weight: OptFloat = None
+            self._weight_fn: Optional[Callable[[T], float]] = None
+        else:
+            if isinstance(max_weight, bool) or not isinstance(max_weight, (int, float)):
+                raise TypeError("max_weight must be a number")
+            if not math.isfinite(max_weight) or max_weight <= 0:
+                raise ValueError("max_weight must be a positive finite number")
+            if not callable(weight):
+                raise TypeError(
+                    "a callable weight function is required when max_weight is set"
+                )
+            self._max_weight = max_weight
+            self._weight_fn = weight
+        self._current_weight = 0.0
+        # id(item) -> weights of enqueued references to that object;
+        # the queue itself holds a strong reference to every enqueued item,
+        # so an id cannot be recycled while its entry is alive
+        self._item_weights: dict[int, list[float]] = {}
 
         self._init(maxsize)
 
@@ -155,7 +192,7 @@ class Queue(Generic[T]):
             self._is_shutdown = True
             if immediate:
                 while self._qsize():
-                    self._get()
+                    self._get_internal()
                     if self._unfinished_tasks > 0:
                         self._unfinished_tasks -= 1
                 # release all blocked threads in `join()`
@@ -210,6 +247,16 @@ class Queue(Generic[T]):
         return self._maxsize
 
     @property
+    def max_weight(self) -> OptFloat:
+        """The configured total weight budget, or None if weighting is off."""
+        return self._max_weight
+
+    @property
+    def current_weight(self) -> float:
+        """The total weight of the items currently enqueued."""
+        return self._current_weight
+
+    @property
     def sync_q(self) -> "_SyncQueueProxy[T]":
         return self._sync_queue
 
@@ -235,9 +282,57 @@ class Queue(Generic[T]):
     def _get(self) -> T:
         return self._queue.popleft()
 
-    def _put_internal(self, item: T) -> None:
+    def _compute_weight(self, item: T) -> float:
+        # Called without any lock held, before the item is enqueued.
+        # The weight is computed exactly once per put call; the stored
+        # value is used for the whole lifetime of the item in the queue,
+        # so mutating the item afterwards does not change the accounting.
+        if self._weight_fn is None:
+            return 0.0
+        w = self._weight_fn(item)
+        if isinstance(w, bool) or not isinstance(w, (int, float)):
+            raise TypeError(
+                f"weight function must return a number, got {type(w).__name__}"
+            )
+        if not math.isfinite(w) or w < 0:
+            raise ValueError(
+                f"item weight must be a non-negative finite number, got {w}"
+            )
+        if w > self._max_weight:
+            raise ValueError(
+                f"item weight {w} exceeds max_weight {self._max_weight}"
+            )
+        return w
+
+    def _has_capacity(self, weight: float) -> bool:
+        # Warning!
+        # The function should be called when self._sync_mutex is locked,
+        # otherwise the code is not thread-safe
+        if 0 < self._maxsize <= self._qsize():
+            return False
+        if (
+            self._max_weight is not None
+            and self._current_weight + weight > self._max_weight
+        ):
+            return False
+        return True
+
+    def _put_internal(self, item: T, weight: float = 0.0) -> None:
         self._put(item)
         self._unfinished_tasks += 1
+        if self._max_weight is not None:
+            self._current_weight += weight
+            self._item_weights.setdefault(id(item), []).append(weight)
+
+    def _get_internal(self) -> T:
+        item = self._get()
+        if self._max_weight is not None:
+            weights = self._item_weights.get(id(item))
+            if weights is not None:
+                self._current_weight -= weights.pop()
+                if not weights:
+                    del self._item_weights[id(item)]
+        return item
 
     async def _do_async_notifier(self, method: Callable[[], None]) -> None:
         async with self._async_mutex:
@@ -273,6 +368,16 @@ class _SyncQueueProxy(SyncQueue[T]):
     @property
     def maxsize(self) -> int:
         return self._parent._maxsize
+
+    @property
+    def max_weight(self) -> OptFloat:
+        """The configured total weight budget, or None if weighting is off."""
+        return self._parent._max_weight
+
+    @property
+    def current_weight(self) -> float:
+        """The total weight of the items currently enqueued."""
+        return self._parent._current_weight
 
     @property
     def closed(self) -> bool:
@@ -365,40 +470,45 @@ class _SyncQueueProxy(SyncQueue[T]):
         Otherwise ('block' is false), put an item on the queue if a free slot
         is immediately available, else raise the Full exception ('timeout'
         is ignored in that case).
+
+        If the queue was created with a weight budget, the item weight is
+        computed once before enqueueing; a blocked put does not reserve
+        budget, so a later smaller item that fits may overtake a waiting
+        bigger one.
         """
         parent = self._parent
+        w = parent._compute_weight(item)
         with parent._sync_not_full:
             if parent._is_shutdown:
                 raise SyncQueueShutDown
-            if parent._maxsize > 0:
-                if not block:
-                    if parent._qsize() >= parent._maxsize:
+            if not block:
+                if not parent._has_capacity(w):
+                    raise SyncQueueFull
+            elif timeout is None:
+                while not parent._has_capacity(w):
+                    parent._sync_not_full_waiting += 1
+                    try:
+                        parent._sync_not_full.wait()
+                    finally:
+                        parent._sync_not_full_waiting -= 1
+                    if parent._is_shutdown:
+                        raise SyncQueueShutDown
+            elif timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number")
+            else:
+                endtime = monotonic() + timeout
+                while not parent._has_capacity(w):
+                    remaining = endtime - monotonic()
+                    if remaining <= 0.0:
                         raise SyncQueueFull
-                elif timeout is None:
-                    while parent._qsize() >= parent._maxsize:
-                        parent._sync_not_full_waiting += 1
-                        try:
-                            parent._sync_not_full.wait()
-                        finally:
-                            parent._sync_not_full_waiting -= 1
-                        if parent._is_shutdown:
-                            raise SyncQueueShutDown
-                elif timeout < 0:
-                    raise ValueError("'timeout' must be a non-negative number")
-                else:
-                    endtime = monotonic() + timeout
-                    while parent._qsize() >= parent._maxsize:
-                        remaining = endtime - monotonic()
-                        if remaining <= 0.0:
-                            raise SyncQueueFull
-                        parent._sync_not_full_waiting += 1
-                        try:
-                            parent._sync_not_full.wait(remaining)
-                        finally:
-                            parent._sync_not_full_waiting -= 1
-                        if parent._is_shutdown:
-                            raise SyncQueueShutDown
-            parent._put_internal(item)
+                    parent._sync_not_full_waiting += 1
+                    try:
+                        parent._sync_not_full.wait(remaining)
+                    finally:
+                        parent._sync_not_full_waiting -= 1
+                    if parent._is_shutdown:
+                        raise SyncQueueShutDown
+            parent._put_internal(item, w)
             if parent._sync_not_empty_waiting:
                 parent._sync_not_empty.notify()
             if parent._async_not_empty_waiting:
@@ -446,7 +556,7 @@ class _SyncQueueProxy(SyncQueue[T]):
                         parent._sync_not_empty_waiting -= 1
                     if parent._is_shutdown and not parent._qsize():
                         raise SyncQueueShutDown
-            item = parent._get()
+            item = parent._get_internal()
             if parent._sync_not_full_waiting:
                 parent._sync_not_full.notify()
             if parent._async_not_full_waiting:
@@ -516,6 +626,16 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         parent = self._parent
         return parent._maxsize
 
+    @property
+    def max_weight(self) -> OptFloat:
+        """The configured total weight budget, or None if weighting is off."""
+        return self._parent._max_weight
+
+    @property
+    def current_weight(self) -> float:
+        """The total weight of the items currently enqueued."""
+        return self._parent._current_weight
+
     def empty(self) -> bool:
         """Return True if the queue is empty, False otherwise."""
         return self.qsize() == 0
@@ -539,14 +659,20 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         slot is available before adding item.
 
         This method is a coroutine.
+
+        If the queue was created with a weight budget, the item weight is
+        computed once before enqueueing; a blocked put does not reserve
+        budget, so a later smaller item that fits may overtake a waiting
+        bigger one. Cancelling a waiting put never consumes budget.
         """
         parent = self._parent
+        w = parent._compute_weight(item)
         async with parent._async_not_full:
             with parent._sync_mutex:
                 if parent._is_shutdown:
                     raise AsyncQueueShutDown
                 parent._get_loop()  # check the event loop
-                while 0 < parent._maxsize <= parent._qsize():
+                while not parent._has_capacity(w):
                     parent._async_not_full_waiting += 1
                     parent._sync_mutex.release()
                     try:
@@ -557,7 +683,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                     if parent._is_shutdown:
                         raise AsyncQueueShutDown
 
-                parent._put_internal(item)
+                parent._put_internal(item, w)
                 if parent._async_not_empty_waiting:
                     parent._async_not_empty.notify()
                 if parent._sync_not_empty_waiting:
@@ -569,15 +695,16 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         If no free slot is immediately available, raise QueueFull.
         """
         parent = self._parent
+        w = parent._compute_weight(item)
         with parent._sync_mutex:
             if parent._is_shutdown:
                 raise AsyncQueueShutDown
 
             parent._get_loop()
-            if 0 < parent._maxsize <= parent._qsize():
+            if not parent._has_capacity(w):
                 raise AsyncQueueFull
 
-            parent._put_internal(item)
+            parent._put_internal(item, w)
             if parent._async_not_empty_waiting:
                 parent._notify_async(parent._async_not_empty.notify)
             if parent._sync_not_empty_waiting:
@@ -607,7 +734,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                     if parent._is_shutdown and not parent._qsize():
                         raise AsyncQueueShutDown
 
-                item = parent._get()
+                item = parent._get_internal()
                 if parent._async_not_full_waiting:
                     parent._async_not_full.notify()
                 if parent._sync_not_full_waiting:
@@ -627,7 +754,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 raise AsyncQueueEmpty
 
             parent._get_loop()
-            item = parent._get()
+            item = parent._get_internal()
             if parent._async_not_full_waiting:
                 parent._notify_async(parent._async_not_full.notify)
             if parent._sync_not_full_waiting:
