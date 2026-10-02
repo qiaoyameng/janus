@@ -3,12 +3,15 @@ import sys
 import threading
 from asyncio import QueueEmpty as AsyncQueueEmpty
 from asyncio import QueueFull as AsyncQueueFull
+from asyncio import shield
 from collections import deque
+from concurrent.futures import Future as ThreadFuture
+from functools import partial
 from heapq import heappop, heappush
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
 from time import monotonic
-from typing import Callable, Generic, Optional, Protocol, TypeVar
+from typing import Any, Callable, Generic, Optional, Protocol, TypeVar
 
 if sys.version_info >= (3, 13):
     from asyncio import QueueShutDown as AsyncQueueShutDown
@@ -44,6 +47,46 @@ __all__ = (
 
 T = TypeVar("T")
 OptFloat = Optional[float]
+
+
+class _RendezvousWaiter(Generic[T]):
+    __slots__ = (
+        "is_async",
+        "is_producer",
+        "item",
+        "condition",
+        "future",
+        "handoff_event",
+        "handoff_future",
+        "handoff_ready",
+        "committed",
+        "peer",
+        "exception",
+    )
+
+    def __init__(
+        self,
+        *,
+        is_async: bool,
+        is_producer: bool,
+        item: Optional[T],
+        condition: Optional[threading.Condition] = None,
+        future: Optional[asyncio.Future[Any]] = None,
+        handoff_event: Optional[threading.Event] = None,
+        handoff_future: Optional[ThreadFuture[None]] = None,
+        handoff_ready: bool = False,
+    ) -> None:
+        self.is_async = is_async
+        self.is_producer = is_producer
+        self.item = item
+        self.condition = condition
+        self.future = future
+        self.handoff_event = handoff_event
+        self.handoff_future = handoff_future
+        self.handoff_ready = handoff_ready
+        self.committed = False
+        self.peer: Optional["_RendezvousWaiter[T]"] = None
+        self.exception: Optional[BaseException] = None
 
 
 class BaseQueue(Protocol[T]):
@@ -97,6 +140,7 @@ class Queue(Generic[T]):
 
         self._maxsize = maxsize
         self._is_shutdown = False
+        self._rendezvous = False
 
         self._init(maxsize)
 
@@ -122,9 +166,24 @@ class Queue(Generic[T]):
         self._async_tasks_done_waiting = 0
 
         self._pending: deque[asyncio.Future[None]] = deque()
+        self._rendezvous_producers: deque["_RendezvousWaiter[T]"] = deque()
+        self._rendezvous_consumers: deque["_RendezvousWaiter[T]"] = deque()
+        self._rendezvous_handoffs: deque["_RendezvousWaiter[T]"] = deque()
+        self._rendezvous_handoff_lock = threading.Lock()
 
         self._sync_queue = _SyncQueueProxy(self)
         self._async_queue = _AsyncQueueProxy(self)
+
+    @classmethod
+    def rendezvous(cls) -> "Queue[T]":
+        """Create a queue with no buffered slots."""
+        queue = cls(0)
+        queue._rendezvous = True
+        try:
+            queue._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        return queue
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
         # Warning!
@@ -154,15 +213,20 @@ class Queue(Generic[T]):
         with self._sync_mutex:
             self._is_shutdown = True
             if immediate:
-                while self._qsize():
-                    self._get()
-                    if self._unfinished_tasks > 0:
-                        self._unfinished_tasks -= 1
+                if self._rendezvous:
+                    self._abort_rendezvous_waiters()
+                else:
+                    while self._qsize():
+                        self._get()
+                        if self._unfinished_tasks > 0:
+                            self._unfinished_tasks -= 1
                 # release all blocked threads in `join()`
                 if self._sync_tasks_done_waiting:
                     self._sync_tasks_done.notify_all()
                 if self._async_tasks_done_waiting:
                     self._notify_async(self._async_tasks_done.notify_all)
+            if self._rendezvous:
+                return
             # All getters need to re-check queue-empty to raise ShutDown
             if self._sync_not_empty_waiting:
                 self._sync_not_empty.notify_all()
@@ -239,6 +303,370 @@ class Queue(Generic[T]):
         self._put(item)
         self._unfinished_tasks += 1
 
+    def _abort_rendezvous_waiters(self) -> None:
+        for waiter in self._rendezvous_producers:
+            exception = (
+                AsyncQueueShutDown() if waiter.is_async else SyncQueueShutDown()
+            )
+            if waiter.handoff_event is not None:
+                waiter.handoff_event.set()
+            self._resolve_rendezvous_waiter(waiter, exception)
+        for waiter in self._rendezvous_consumers:
+            exception = (
+                AsyncQueueShutDown() if waiter.is_async else SyncQueueShutDown()
+            )
+            self._resolve_rendezvous_waiter(waiter, exception)
+        self._flush_rendezvous_handoffs()
+        self._rendezvous_producers.clear()
+        self._rendezvous_consumers.clear()
+
+    def _resolve_rendezvous_waiter(
+        self,
+        waiter: "_RendezvousWaiter[T]",
+        exception: Optional[BaseException] = None,
+        item: Optional[T] = None,
+    ) -> None:
+        waiter.exception = exception
+        if waiter.condition is not None:
+            waiter.condition.notify()
+        if waiter.future is not None:
+            future = waiter.future
+            if exception is None:
+                callback = partial(future.set_result, item)
+            else:
+                callback = partial(future.set_exception, exception)
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+            if threading.get_ident() == loop._thread_id:
+                callback()
+            else:
+                loop.call_soon_threadsafe(callback)
+
+    def _commit_rendezvous(
+        self,
+        producer: "_RendezvousWaiter[T]",
+        consumer: "_RendezvousWaiter[T]",
+    ) -> T:
+        item = producer.item
+
+        producer.committed = True
+        consumer.committed = True
+        producer.peer = consumer
+        consumer.peer = producer
+        consumer.item = item
+        if producer in self._rendezvous_producers:
+            self._rendezvous_producers.remove(producer)
+        if consumer in self._rendezvous_consumers:
+            self._rendezvous_consumers.remove(consumer)
+        self._rendezvous_handoffs.append(producer)
+        self._unfinished_tasks += 1
+
+        if consumer.condition is not None:
+            consumer.condition.notify()
+
+        if producer.condition is not None:
+            producer.condition.notify()
+
+        return item
+
+    def _new_sync_rendezvous_waiter(
+        self, is_producer: bool, item: Optional[T] = None
+    ) -> "_RendezvousWaiter[T]":
+        return _RendezvousWaiter(
+            is_async=False,
+            is_producer=is_producer,
+            item=item,
+            condition=threading.Condition(self._sync_mutex),
+            handoff_event=threading.Event() if is_producer else None,
+        )
+
+    def _new_async_rendezvous_waiter(
+        self, is_producer: bool, item: Optional[T] = None
+    ) -> "_RendezvousWaiter[T]":
+        handoff_event = threading.Event() if is_producer else None
+        handoff_future = None
+        if is_producer and handoff_event is not None:
+            handoff_future = ThreadFuture()
+
+            def wait_for_handoff() -> None:
+                handoff_event.wait()  # type: ignore[union-attr]
+                handoff_future.set_result(None)  # type: ignore[union-attr]
+
+            threading.Thread(target=wait_for_handoff, daemon=True).start()
+        return _RendezvousWaiter(
+            is_async=True,
+            is_producer=is_producer,
+            item=item,
+            future=self._get_loop().create_future(),
+            handoff_event=handoff_event,
+            handoff_future=handoff_future,
+        )
+
+    def _signal_rendezvous_handoff(self, producer: "_RendezvousWaiter[T]") -> None:
+        with self._rendezvous_handoff_lock:
+            producer.handoff_ready = True
+            if self._rendezvous_handoffs and self._rendezvous_handoffs[0] is producer:
+                if producer.handoff_event is not None:
+                    producer.handoff_event.set()
+
+    def _finish_rendezvous_handoff(self, producer: "_RendezvousWaiter[T]") -> None:
+        with self._rendezvous_handoff_lock:
+            if self._rendezvous_handoffs and self._rendezvous_handoffs[0] is producer:
+                self._rendezvous_handoffs.popleft()
+            if (
+                self._rendezvous_handoffs
+                and self._rendezvous_handoffs[0].handoff_ready
+            ):
+                candidate = self._rendezvous_handoffs[0]
+                if candidate.handoff_event is not None:
+                    candidate.handoff_event.set()
+
+    def _flush_rendezvous_handoffs(self) -> None:
+        with self._rendezvous_handoff_lock:
+            while self._rendezvous_handoffs:
+                producer = self._rendezvous_handoffs[0]
+                if producer.handoff_event is None or not producer.handoff_event.is_set():
+                    producer.handoff_event.set()
+                self._rendezvous_handoffs.popleft()
+
+    def _pop_rendezvous_waiter(
+        self, waiters: deque["_RendezvousWaiter[T]"]
+    ) -> Optional["_RendezvousWaiter[T]"]:
+        while waiters:
+            waiter = waiters.popleft()
+            if waiter.future is not None and waiter.future.done():
+                continue
+            return waiter
+        return None
+
+    def _sync_rendezvous_put(
+        self, item: T, block: bool, timeout: OptFloat
+    ) -> None:
+        if timeout is not None and timeout < 0:
+            raise ValueError("'timeout' must be a non-negative number")
+
+        endtime: Optional[float] = None
+        if timeout is not None:
+            endtime = monotonic() + timeout
+
+        committed = False
+        consumer: Optional[_RendezvousWaiter[T]] = None
+        producer: _RendezvousWaiter[T]
+        with self._sync_mutex:
+            if self._is_shutdown:
+                raise SyncQueueShutDown
+            consumer = self._pop_rendezvous_waiter(self._rendezvous_consumers)
+            if consumer is None:
+                if not block:
+                    raise SyncQueueFull
+                producer = self._new_sync_rendezvous_waiter(True, item)
+                self._rendezvous_producers.append(producer)
+                while not producer.committed:
+                    remaining = None
+                    if endtime is not None:
+                        remaining = endtime - monotonic()
+                        if remaining <= 0:
+                            self._rendezvous_producers.remove(producer)
+                            raise SyncQueueFull
+                    producer.condition.wait(remaining)  # type: ignore[union-attr]
+                    if producer.exception is not None:
+                        if producer in self._rendezvous_producers:
+                            self._rendezvous_producers.remove(producer)
+                        raise producer.exception
+                while (
+                    self._rendezvous_handoffs
+                    and self._rendezvous_handoffs[0] is not producer
+                ):
+                    producer.condition.wait()
+                if producer.handoff_event is not None:
+                    producer.handoff_event.wait()
+                self._finish_rendezvous_handoff(producer)
+                consumer = producer.peer
+            else:
+                producer = self._new_sync_rendezvous_waiter(True, item)
+                self._commit_rendezvous(producer, consumer)
+                committed = True
+
+        assert consumer is not None
+        assert producer is not None
+        if consumer.future is not None:
+            if committed:
+                self._resolve_rendezvous_waiter(consumer, item=item)
+        if block and producer.handoff_event is not None:
+            producer.handoff_event.wait()
+            self._finish_rendezvous_handoff(producer)
+
+    def _sync_rendezvous_get(
+        self, block: bool, timeout: OptFloat
+    ) -> T:
+        if timeout is not None and timeout < 0:
+            raise ValueError("'timeout' must be a non-negative number")
+
+        endtime: Optional[float] = None
+        if timeout is not None:
+            endtime = monotonic() + timeout
+
+        committed = False
+        producer: Optional[_RendezvousWaiter[T]] = None
+        consumer: _RendezvousWaiter[T]
+        with self._sync_mutex:
+            if self._is_shutdown:
+                raise SyncQueueShutDown
+            producer = self._pop_rendezvous_waiter(self._rendezvous_producers)
+            if producer is None:
+                if not block:
+                    raise SyncQueueEmpty
+                consumer = self._new_sync_rendezvous_waiter(False)
+                self._rendezvous_consumers.append(consumer)
+                while not consumer.committed:
+                    remaining = None
+                    if endtime is not None:
+                        remaining = endtime - monotonic()
+                        if remaining <= 0:
+                            self._rendezvous_consumers.remove(consumer)
+                            raise SyncQueueEmpty
+                    consumer.condition.wait(remaining)  # type: ignore[union-attr]
+                    if consumer.exception is not None:
+                        if consumer in self._rendezvous_consumers:
+                            self._rendezvous_consumers.remove(consumer)
+                        raise consumer.exception
+                producer = consumer.peer
+                item = consumer.item
+            else:
+                consumer = self._new_sync_rendezvous_waiter(False)
+                item = self._commit_rendezvous(producer, consumer)
+                committed = True
+
+        assert producer is not None
+        assert consumer is not None
+        if producer.future is not None:
+            self._resolve_rendezvous_waiter(producer)
+        if producer.handoff_event is not None:
+            producer.handoff_event.set()
+        return item
+
+    async def _async_rendezvous_put(self, item: T) -> None:
+        producer: _RendezvousWaiter[T]
+        committed = False
+        consumer: Optional[_RendezvousWaiter[T]] = None
+        with self._sync_mutex:
+            if self._is_shutdown:
+                raise AsyncQueueShutDown
+            self._get_loop()
+            consumer = self._pop_rendezvous_waiter(self._rendezvous_consumers)
+            if consumer is None:
+                producer = self._new_async_rendezvous_waiter(True, item)
+                self._rendezvous_producers.append(producer)
+            else:
+                producer = self._new_async_rendezvous_waiter(True, item)
+                self._commit_rendezvous(producer, consumer)
+                if consumer.condition is not None:
+                    consumer.condition.notify()
+                committed = True
+
+        if committed:
+            assert consumer is not None
+            if consumer.future is not None:
+                self._resolve_rendezvous_waiter(consumer, item=item)
+            await self._wait_async_rendezvous_handoff(producer)
+            return
+
+        while not producer.committed:
+            try:
+                await shield(producer.future)  # type: ignore[union-attr]
+            except asyncio.CancelledError:
+                with self._sync_mutex:
+                    if producer in self._rendezvous_producers:
+                        self._rendezvous_producers.remove(producer)
+                    raise
+        await self._wait_async_rendezvous_handoff(producer)
+
+    async def _wait_async_rendezvous_handoff(
+        self, producer: "_RendezvousWaiter[T]"
+    ) -> None:
+        if producer.handoff_future is None:
+            return
+        await asyncio.wrap_future(producer.handoff_future)
+        self._finish_rendezvous_handoff(producer)
+
+    def _async_rendezvous_put_nowait(self, item: T) -> None:
+        with self._sync_mutex:
+            if self._is_shutdown:
+                raise AsyncQueueShutDown
+            self._get_loop()
+            consumer = self._pop_rendezvous_waiter(self._rendezvous_consumers)
+            if consumer is None:
+                raise AsyncQueueFull
+            producer = self._new_async_rendezvous_waiter(True, item)
+            self._commit_rendezvous(producer, consumer)
+            if consumer.condition is not None:
+                consumer.condition.notify()
+
+        if consumer.future is not None:
+            self._resolve_rendezvous_waiter(consumer, item=item)
+        elif producer.handoff_event is not None:
+            producer.handoff_event.set()
+        self._finish_rendezvous_handoff(producer)
+
+    async def _async_rendezvous_get(self) -> T:
+        consumer: _RendezvousWaiter[T]
+        committed = False
+        producer: Optional[_RendezvousWaiter[T]] = None
+
+        with self._sync_mutex:
+            if self._is_shutdown:
+                raise AsyncQueueShutDown
+            self._get_loop()
+
+            producer = self._pop_rendezvous_waiter(self._rendezvous_producers)
+            if producer is None:
+                consumer = self._new_async_rendezvous_waiter(False)
+                self._rendezvous_consumers.append(consumer)
+            else:
+                consumer = self._new_async_rendezvous_waiter(False)
+                self._commit_rendezvous(producer, consumer)
+                committed = True
+
+        if committed:
+            assert producer is not None
+            if producer.future is not None:
+                self._resolve_rendezvous_waiter(producer)
+            self._signal_rendezvous_handoff(producer)
+            return producer.item
+
+        while not consumer.committed:
+            try:
+                await shield(consumer.future)  # type: ignore[union-attr]
+            except asyncio.CancelledError:
+                with self._sync_mutex:
+                    if consumer in self._rendezvous_consumers:
+                        self._rendezvous_consumers.remove(consumer)
+                    raise
+
+        producer = consumer.peer
+        assert producer is not None
+        if producer.future is not None:
+            self._resolve_rendezvous_waiter(producer)
+        self._signal_rendezvous_handoff(producer)
+        return consumer.item  # type: ignore[return-value]
+
+    def _async_rendezvous_get_nowait(self) -> T:
+        with self._sync_mutex:
+            if self._is_shutdown:
+                raise AsyncQueueShutDown
+            self._get_loop()
+            producer = self._pop_rendezvous_waiter(self._rendezvous_producers)
+            if producer is None:
+                raise AsyncQueueEmpty
+            consumer = self._new_async_rendezvous_waiter(False)
+            self._commit_rendezvous(producer, consumer)
+
+        if producer.future is not None:
+            self._resolve_rendezvous_waiter(producer)
+        self._signal_rendezvous_handoff(producer)
+        return producer.item
+
     async def _do_async_notifier(self, method: Callable[[], None]) -> None:
         async with self._async_mutex:
             method()
@@ -259,7 +687,6 @@ class Queue(Generic[T]):
             # async API is not available, nothing to notify
             return
         loop.call_soon_threadsafe(self._setup_async_notifier, loop, method)
-
 
 class _SyncQueueProxy(SyncQueue[T]):
     """Create a queue object with a given maximum size.
@@ -324,6 +751,8 @@ class _SyncQueueProxy(SyncQueue[T]):
 
     def qsize(self) -> int:
         """Return the approximate size of the queue (not reliable!)."""
+        if self._parent._rendezvous:
+            return 0
         return self._parent._qsize()
 
     @property
@@ -342,6 +771,8 @@ class _SyncQueueProxy(SyncQueue[T]):
         To create code that needs to wait for all queued tasks to be
         completed, the preferred technique is to use the join() method.
         """
+        if self._parent._rendezvous:
+            return True
         return not self._parent._qsize()
 
     def full(self) -> bool:
@@ -353,6 +784,9 @@ class _SyncQueueProxy(SyncQueue[T]):
         qsize() can be used.
         """
         parent = self._parent
+        if parent._rendezvous:
+            with parent._sync_mutex:
+                return bool(parent._rendezvous_consumers)
         return 0 < parent._maxsize <= parent._qsize()
 
     def put(self, item: T, block: bool = True, timeout: OptFloat = None) -> None:
@@ -367,6 +801,8 @@ class _SyncQueueProxy(SyncQueue[T]):
         is ignored in that case).
         """
         parent = self._parent
+        if parent._rendezvous:
+            return parent._sync_rendezvous_put(item, block, timeout)
         with parent._sync_not_full:
             if parent._is_shutdown:
                 raise SyncQueueShutDown
@@ -416,6 +852,8 @@ class _SyncQueueProxy(SyncQueue[T]):
         in that case).
         """
         parent = self._parent
+        if parent._rendezvous:
+            return parent._sync_rendezvous_get(block, timeout)
         with parent._sync_not_empty:
             if parent._is_shutdown and not parent._qsize():
                 raise SyncQueueShutDown
@@ -502,6 +940,8 @@ class _AsyncQueueProxy(AsyncQueue[T]):
     def qsize(self) -> int:
         """Number of items in the queue."""
         parent = self._parent
+        if parent._rendezvous:
+            return 0
         return parent._qsize()
 
     @property
@@ -527,6 +967,9 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         then full() is never True.
         """
         parent = self._parent
+        if parent._rendezvous:
+            with parent._sync_mutex:
+                return bool(parent._rendezvous_consumers)
         if parent._maxsize <= 0:
             return False
         else:
@@ -541,6 +984,9 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         This method is a coroutine.
         """
         parent = self._parent
+        if parent._rendezvous:
+            await parent._async_rendezvous_put(item)
+            return
         async with parent._async_not_full:
             with parent._sync_mutex:
                 if parent._is_shutdown:
@@ -569,6 +1015,9 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         If no free slot is immediately available, raise QueueFull.
         """
         parent = self._parent
+        if parent._rendezvous:
+            parent._async_rendezvous_put_nowait(item)
+            return
         with parent._sync_mutex:
             if parent._is_shutdown:
                 raise AsyncQueueShutDown
@@ -591,6 +1040,8 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         This method is a coroutine.
         """
         parent = self._parent
+        if parent._rendezvous:
+            return await parent._async_rendezvous_get()
         async with parent._async_not_empty:
             with parent._sync_mutex:
                 if parent._is_shutdown and not parent._qsize():
@@ -620,6 +1071,8 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         Return an item if one is immediately available, else raise QueueEmpty.
         """
         parent = self._parent
+        if parent._rendezvous:
+            return parent._async_rendezvous_get_nowait()
         with parent._sync_mutex:
             if parent._is_shutdown and not parent._qsize():
                 raise AsyncQueueShutDown

@@ -35,6 +35,11 @@ Three queues are available:
 * ``LifoQueue``
 * ``PriorityQueue``
 
+``Queue.rendezvous()`` creates a separate zero-buffer mode. Unlike a normal
+``Queue(0)``, a producer only completes a ``put`` once a waiting ``get`` has
+committed to taking that exact item. ``put_nowait`` and ``get_nowait`` only
+succeed when the opposite side is already waiting.
+
 Each has two properties: ``sync_q`` and ``async_q``.
 
 Use the first to get synchronous interface and the second to get asynchronous
