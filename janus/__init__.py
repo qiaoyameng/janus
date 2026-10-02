@@ -8,7 +8,7 @@ from heapq import heappop, heappush
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
 from time import monotonic
-from typing import Callable, Generic, Optional, Protocol, TypeVar
+from typing import Awaitable, Callable, Generic, Optional, Protocol, TypeVar, cast
 
 if sys.version_info >= (3, 13):
     from asyncio import QueueShutDown as AsyncQueueShutDown
@@ -28,6 +28,7 @@ else:
 __version__ = "2.0.0"
 __all__ = (
     "Queue",
+    "ZeroQueue",
     "PriorityQueue",
     "LifoQueue",
     "SyncQueue",
@@ -44,6 +45,42 @@ __all__ = (
 
 T = TypeVar("T")
 OptFloat = Optional[float]
+_MISSING: object = object()
+
+
+class _ZeroWaiter:
+    __slots__ = (
+        "is_async",
+        "ready_event",
+        "ready_future",
+        "done_event",
+        "done_future",
+        "item",
+        "partner",
+    )
+
+    def __init__(
+        self,
+        is_async: bool,
+        item: object = _MISSING,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
+        self.is_async = is_async
+        self.ready_event: Optional[threading.Event] = None
+        self.ready_future: Optional[asyncio.Future[None]] = None
+        self.done_event: Optional[threading.Event] = None
+        self.done_future: Optional[asyncio.Future[None]] = None
+        if is_async:
+            assert loop is not None
+            self.ready_future = loop.create_future()
+            self.done_future = loop.create_future()
+        else:
+            self.ready_event = threading.Event()
+            self.done_event = threading.Event()
+        self.item: Optional[T] = (
+            None if item is _MISSING else cast("T", item)
+        )
+        self.partner: Optional[_ZeroWaiter] = None
 
 
 class BaseQueue(Protocol[T]):
@@ -90,6 +127,7 @@ class AsyncQueue(BaseQueue[T], Protocol[T]):
 
 class Queue(Generic[T]):
     _loop: Optional[asyncio.AbstractEventLoop] = None
+    _zero_buffer = False
 
     def __init__(self, maxsize: int = 0) -> None:
         if sys.version_info < (3, 10):
@@ -122,6 +160,15 @@ class Queue(Generic[T]):
         self._async_tasks_done_waiting = 0
 
         self._pending: deque[asyncio.Future[None]] = deque()
+        self._zero_putters: deque[_ZeroWaiter] = deque()
+        self._zero_getters: deque[_ZeroWaiter] = deque()
+        self._zero_event_factory: Optional[Callable[[], threading.Event]] = None
+        self._on_zero_async_wait: Optional[
+            Callable[[str], Awaitable[None]]
+        ] = None
+        self._on_zero_async_paired: Optional[
+            Callable[[str], Awaitable[None]]
+        ] = None
 
         self._sync_queue = _SyncQueueProxy(self)
         self._async_queue = _AsyncQueueProxy(self)
@@ -163,15 +210,22 @@ class Queue(Generic[T]):
                     self._sync_tasks_done.notify_all()
                 if self._async_tasks_done_waiting:
                     self._notify_async(self._async_tasks_done.notify_all)
-            # All getters need to re-check queue-empty to raise ShutDown
-            if self._sync_not_empty_waiting:
-                self._sync_not_empty.notify_all()
-            if self._sync_not_full_waiting:
-                self._sync_not_full.notify_all()
-            if self._async_not_empty_waiting:
-                self._notify_async(self._async_not_empty.notify_all)
-            if self._async_not_full_waiting:
-                self._notify_async(self._async_not_full.notify_all)
+            if self._zero_buffer:
+                waiters = self._zero_putters
+                self._zero_putters = deque()
+                waiters.extend(self._zero_getters)
+                self._zero_getters = deque()
+                for waiter in waiters:
+                    self._zero_signal_ready(waiter)
+            else:
+                if self._sync_not_empty_waiting:
+                    self._sync_not_empty.notify_all()
+                if self._sync_not_full_waiting:
+                    self._sync_not_full.notify_all()
+                if self._async_not_empty_waiting:
+                    self._notify_async(self._async_not_empty.notify_all)
+                if self._async_not_full_waiting:
+                    self._notify_async(self._async_not_full.notify_all)
 
     def close(self) -> None:
         """Close the queue.
@@ -260,6 +314,65 @@ class Queue(Generic[T]):
             return
         loop.call_soon_threadsafe(self._setup_async_notifier, loop, method)
 
+    def _zero_signal_ready(self, waiter: _ZeroWaiter) -> None:
+        if waiter.is_async:
+            future = waiter.ready_future
+            assert future is not None
+            if (
+                not future.done()
+                and self._loop is not None
+                and not self._loop.is_closed()
+            ):
+                self._loop.call_soon_threadsafe(self._zero_set_future, future)
+        else:
+            event = waiter.ready_event
+            assert event is not None
+            event.set()
+
+    def _zero_signal_done(self, waiter: _ZeroWaiter) -> None:
+        if waiter.is_async:
+            future = waiter.done_future
+            assert future is not None
+            if (
+                not future.done()
+                and self._loop is not None
+                and not self._loop.is_closed()
+            ):
+                self._loop.call_soon_threadsafe(self._zero_set_future, future)
+        else:
+            event = waiter.done_event
+            assert event is not None
+            event.set()
+
+    @staticmethod
+    def _zero_set_future(future: "asyncio.Future[None]") -> None:
+        if not future.done():
+            future.set_result(None)
+
+    def _zero_pair_put(self, putter: _ZeroWaiter) -> Optional[_ZeroWaiter]:
+        if not self._zero_getters:
+            return None
+        getter = self._zero_getters.popleft()
+        getter.item = putter.item
+        getter.partner = putter
+        putter.partner = getter
+        self._unfinished_tasks += 1
+        return getter
+
+    def _zero_pair_get(self, getter: _ZeroWaiter) -> Optional[_ZeroWaiter]:
+        if not self._zero_putters:
+            return None
+        putter = self._zero_putters.popleft()
+        getter.item = putter.item
+        getter.partner = putter
+        putter.partner = getter
+        self._unfinished_tasks += 1
+        return putter
+
+    def _zero_make_event(self) -> threading.Event:
+        if self._zero_event_factory is None:
+            return threading.Event()
+        return self._zero_event_factory()
 
 class _SyncQueueProxy(SyncQueue[T]):
     """Create a queue object with a given maximum size.
@@ -353,6 +466,8 @@ class _SyncQueueProxy(SyncQueue[T]):
         qsize() can be used.
         """
         parent = self._parent
+        if parent._zero_buffer:
+            return True
         return 0 < parent._maxsize <= parent._qsize()
 
     def put(self, item: T, block: bool = True, timeout: OptFloat = None) -> None:
@@ -370,6 +485,8 @@ class _SyncQueueProxy(SyncQueue[T]):
         with parent._sync_not_full:
             if parent._is_shutdown:
                 raise SyncQueueShutDown
+            if parent._zero_buffer:
+                return self._zero_put(item, block, timeout)
             if parent._maxsize > 0:
                 if not block:
                     if parent._qsize() >= parent._maxsize:
@@ -417,8 +534,12 @@ class _SyncQueueProxy(SyncQueue[T]):
         """
         parent = self._parent
         with parent._sync_not_empty:
-            if parent._is_shutdown and not parent._qsize():
+            if parent._is_shutdown and not (
+                parent._zero_buffer and parent._zero_putters
+            ) and not parent._qsize():
                 raise SyncQueueShutDown
+            if parent._zero_buffer:
+                return self._zero_get(block, timeout)
             if not block:
                 if not parent._qsize():
                     raise SyncQueueEmpty
@@ -484,6 +605,129 @@ class _SyncQueueProxy(SyncQueue[T]):
         """
         self._parent.shutdown(immediate)
 
+    def _zero_put(
+        self, item: T, block: bool, timeout: OptFloat
+    ) -> None:
+        parent = self._parent
+        deadline = None
+        if not block:
+            if not parent._zero_getters:
+                raise SyncQueueFull
+        else:
+            if timeout is not None:
+                if timeout < 0:
+                    raise ValueError("'timeout' must be a non-negative number")
+                deadline = monotonic() + timeout
+
+        putter = _ZeroWaiter(is_async=False, item=item)
+        putter.ready_event = parent._zero_make_event()
+        getter = parent._zero_pair_put(putter)
+        if getter is None:
+            parent._zero_putters.append(putter)
+            ready = putter.ready_event
+            assert ready is not None
+            self._zero_wait_for_partner(
+                putter,
+                parent._zero_putters,
+                parent._sync_not_full,
+                ready,
+                deadline,
+                SyncQueueFull,
+            )
+            getter = putter.partner
+            assert getter is not None
+            if not block:
+                parent._zero_signal_ready(getter)
+                return
+        else:
+            assert getter is not None
+            done = putter.done_event
+            assert done is not None
+            if not block:
+                parent._zero_signal_ready(getter)
+                return
+
+        self._zero_wait_for_done(putter, getter)
+
+    def _zero_get(self, block: bool, timeout: OptFloat) -> T:
+        parent = self._parent
+        deadline = None
+        if not block:
+            if not parent._zero_putters:
+                raise SyncQueueEmpty
+        else:
+            if timeout is not None:
+                if timeout < 0:
+                    raise ValueError("'timeout' must be a non-negative number")
+                deadline = monotonic() + timeout
+
+        getter = _ZeroWaiter(is_async=False)
+        getter.ready_event = parent._zero_make_event()
+        putter = parent._zero_pair_get(getter)
+        if putter is None:
+            parent._zero_getters.append(getter)
+            ready = getter.ready_event
+            assert ready is not None
+            self._zero_wait_for_partner(
+                getter,
+                parent._zero_getters,
+                parent._sync_not_empty,
+                ready,
+                deadline,
+                SyncQueueEmpty,
+            )
+            putter = getter.partner
+
+        item = cast("T", getter.item)
+        assert putter is not None
+        parent._zero_signal_ready(putter)
+        parent._zero_signal_done(putter)
+        return item
+
+    def _zero_wait_for_partner(
+        self,
+        waiter: _ZeroWaiter,
+        waiters: "deque[_ZeroWaiter]",
+        condition: threading.Condition,
+        ready: threading.Event,
+        deadline: Optional[float],
+        timeout_exc: type[Exception],
+    ) -> None:
+        parent = self._parent
+        while waiter.partner is None:
+            remaining = None if deadline is None else deadline - monotonic()
+            if remaining is not None and remaining <= 0.0:
+                waiters.remove(waiter)
+                raise timeout_exc
+            saved_state = condition._release_save()
+            try:
+                ready.wait(remaining)
+            finally:
+                condition._acquire_restore(saved_state)
+            if (
+                waiter.partner is None
+                and deadline is not None
+                and monotonic() >= deadline
+            ):
+                waiters.remove(waiter)
+                raise timeout_exc
+            if waiter.partner is None and parent._is_shutdown:
+                waiters.remove(waiter)
+                raise SyncQueueShutDown
+
+    def _zero_wait_for_done(self, putter: _ZeroWaiter, getter: _ZeroWaiter) -> None:
+        parent = self._parent
+        parent._zero_signal_ready(getter)
+        done = putter.done_event
+        assert done is not None
+        condition = parent._sync_not_full
+        while not done.is_set():
+            saved_state = condition._release_save()
+            try:
+                done.wait()
+            finally:
+                condition._acquire_restore(saved_state)
+
 
 class _AsyncQueueProxy(AsyncQueue[T]):
     """Create a queue object with a given maximum size.
@@ -528,7 +772,7 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         """
         parent = self._parent
         if parent._maxsize <= 0:
-            return False
+            return parent._zero_buffer
         else:
             return parent._qsize() >= parent._maxsize
 
@@ -541,6 +785,14 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         This method is a coroutine.
         """
         parent = self._parent
+        with parent._sync_mutex:
+            if parent._is_shutdown:
+                raise AsyncQueueShutDown
+            parent._get_loop()  # check the event loop
+            if parent._zero_buffer:
+                await self._zero_put(item)
+                return
+
         async with parent._async_not_full:
             with parent._sync_mutex:
                 if parent._is_shutdown:
@@ -574,6 +826,16 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 raise AsyncQueueShutDown
 
             parent._get_loop()
+            if parent._zero_buffer:
+                if not parent._zero_getters:
+                    raise AsyncQueueFull
+                loop = asyncio.get_running_loop()
+                putter = _ZeroWaiter(True, item, loop)
+                getter = parent._zero_pair_put(putter)
+                assert getter is not None
+                parent._zero_signal_ready(getter)
+                return
+
             if 0 < parent._maxsize <= parent._qsize():
                 raise AsyncQueueFull
 
@@ -591,6 +853,15 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         This method is a coroutine.
         """
         parent = self._parent
+        with parent._sync_mutex:
+            if parent._is_shutdown and not (
+                parent._zero_buffer and parent._zero_putters
+            ) and not parent._qsize():
+                raise AsyncQueueShutDown
+            parent._get_loop()  # check the event loop
+            if parent._zero_buffer:
+                return await self._zero_get()
+
         async with parent._async_not_empty:
             with parent._sync_mutex:
                 if parent._is_shutdown and not parent._qsize():
@@ -621,8 +892,21 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         """
         parent = self._parent
         with parent._sync_mutex:
-            if parent._is_shutdown and not parent._qsize():
+            if parent._is_shutdown and not (
+                parent._zero_buffer and parent._zero_putters
+            ) and not parent._qsize():
                 raise AsyncQueueShutDown
+            if parent._zero_buffer:
+                if not parent._zero_putters:
+                    raise AsyncQueueEmpty
+                loop = asyncio.get_running_loop()
+                getter = _ZeroWaiter(True, loop=loop)
+                putter = parent._zero_pair_get(getter)
+                assert putter is not None
+                item = cast("T", getter.item)
+                parent._zero_signal_ready(putter)
+                parent._zero_signal_done(putter)
+                return item
             if not parent._qsize():
                 raise AsyncQueueEmpty
 
@@ -680,6 +964,85 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                         parent._sync_mutex.acquire()
                         parent._async_tasks_done_waiting -= 1
 
+    async def _zero_put(self, item: T) -> None:
+        parent = self._parent
+        loop = asyncio.get_running_loop()
+        putter = _ZeroWaiter(True, item, loop)
+        getter = parent._zero_pair_put(putter)
+        if getter is None:
+            parent._zero_putters.append(putter)
+            ready = putter.ready_future
+            assert ready is not None
+            parent._sync_mutex.release()
+            try:
+                if parent._on_zero_async_wait is not None:
+                    await parent._on_zero_async_wait("put")
+                await ready
+            except asyncio.CancelledError:
+                parent._sync_mutex.acquire()
+                if putter.partner is None:
+                    parent._zero_putters.remove(putter)
+                    raise
+            else:
+                parent._sync_mutex.acquire()
+
+            if putter.partner is None:
+                raise AsyncQueueShutDown
+            getter = putter.partner
+
+        assert getter is not None
+        done = putter.done_future
+        assert done is not None
+        parent._zero_signal_ready(getter)
+        parent._sync_mutex.release()
+        try:
+            await asyncio.shield(done)
+        except asyncio.CancelledError:
+            await asyncio.shield(done)
+        finally:
+            parent._sync_mutex.acquire()
+
+    async def _zero_get(self) -> T:
+        parent = self._parent
+        loop = asyncio.get_running_loop()
+        getter = _ZeroWaiter(True, loop=loop)
+        putter = parent._zero_pair_get(getter)
+        if putter is None:
+            parent._zero_getters.append(getter)
+            ready = getter.ready_future
+            assert ready is not None
+            parent._sync_mutex.release()
+            try:
+                if parent._on_zero_async_wait is not None:
+                    await parent._on_zero_async_wait("get")
+                await ready
+            except asyncio.CancelledError:
+                parent._sync_mutex.acquire()
+                if getter.partner is None:
+                    parent._zero_getters.remove(getter)
+                    raise
+                parent._zero_signal_ready(getter.partner)
+                parent._zero_signal_done(getter.partner)
+                parent._sync_mutex.release()
+            else:
+                parent._sync_mutex.acquire()
+
+            if getter.partner is None:
+                raise AsyncQueueShutDown
+            putter = getter.partner
+
+        assert putter is not None
+        if parent._on_zero_async_paired is not None:
+            parent._sync_mutex.release()
+            try:
+                await parent._on_zero_async_paired("get")
+            finally:
+                parent._sync_mutex.acquire()
+        item = cast("T", getter.item)
+        parent._zero_signal_ready(putter)
+        parent._zero_signal_done(putter)
+        return item
+
     def shutdown(self, immediate: bool = False) -> None:
         """Shut-down the queue, making queue gets and puts raise an exception.
 
@@ -728,3 +1091,12 @@ class LifoQueue(Queue[T]):
 
     def _get(self) -> T:
         return self._queue.pop()
+
+
+class ZeroQueue(Queue[T]):
+    """A zero-buffer queue that completes put() and get() by rendezvous."""
+
+    _zero_buffer = True
+
+    def __init__(self) -> None:
+        super().__init__(0)

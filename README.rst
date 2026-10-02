@@ -29,13 +29,19 @@ follows `asyncio queue design
 Usage
 =====
 
-Three queues are available:
+Four queues are available:
 
 * ``Queue``
 * ``LifoQueue``
 * ``PriorityQueue``
+* ``ZeroQueue``
 
 Each has two properties: ``sync_q`` and ``async_q``.
+
+``ZeroQueue`` is a zero-buffer rendezvous queue. A blocking ``put()`` only
+returns after a ``get()`` has taken the item, while ``put_nowait()`` and
+``get_nowait()`` succeed only when the counterpart is already waiting. The
+traditional ``Queue(maxsize=0)`` remains an unbounded queue.
 
 Use the first to get synchronous interface and the second to get asynchronous
 one.
