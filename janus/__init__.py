@@ -4,6 +4,7 @@ import threading
 from asyncio import QueueEmpty as AsyncQueueEmpty
 from asyncio import QueueFull as AsyncQueueFull
 from collections import deque
+from collections.abc import Hashable
 from heapq import heappop, heappush
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
@@ -28,6 +29,7 @@ else:
 __version__ = "2.0.0"
 __all__ = (
     "Queue",
+    "KeyedQueue",
     "PriorityQueue",
     "LifoQueue",
     "SyncQueue",
@@ -239,6 +241,12 @@ class Queue(Generic[T]):
         self._put(item)
         self._unfinished_tasks += 1
 
+    def _merge(self, item: T) -> bool:
+        # Hook for queue organizations that can absorb an item without
+        # growing the queue.  Called with the sync mutex held, before
+        # the maxsize check.  Returns True if the item was merged.
+        return False
+
     async def _do_async_notifier(self, method: Callable[[], None]) -> None:
         async with self._async_mutex:
             method()
@@ -370,6 +378,8 @@ class _SyncQueueProxy(SyncQueue[T]):
         with parent._sync_not_full:
             if parent._is_shutdown:
                 raise SyncQueueShutDown
+            if parent._merge(item):
+                return
             if parent._maxsize > 0:
                 if not block:
                     if parent._qsize() >= parent._maxsize:
@@ -546,6 +556,8 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 if parent._is_shutdown:
                     raise AsyncQueueShutDown
                 parent._get_loop()  # check the event loop
+                if parent._merge(item):
+                    return
                 while 0 < parent._maxsize <= parent._qsize():
                     parent._async_not_full_waiting += 1
                     parent._sync_mutex.release()
@@ -574,6 +586,8 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 raise AsyncQueueShutDown
 
             parent._get_loop()
+            if parent._merge(item):
+                return
             if 0 < parent._maxsize <= parent._qsize():
                 raise AsyncQueueFull
 
@@ -728,3 +742,54 @@ class LifoQueue(Queue[T]):
 
     def _get(self) -> T:
         return self._queue.pop()
+
+
+class _KeyedSlot(Generic[T]):
+    __slots__ = ("key", "item")
+
+    def __init__(self, key: Hashable, item: T) -> None:
+        self.key = key
+        self.item = item
+
+
+class KeyedQueue(Queue[T]):
+    """Variant of Queue that merges items with equal keys.
+
+    The *key* function maps an item to its key.  If an item is put while
+    another item with the same key is still queued, the new item replaces
+    the old one in place, keeping the position the key originally entered
+    the queue at.  Merging does not increase the unfinished tasks count
+    and never blocks, even if the queue is full.  Once an item is
+    retrieved its key is forgotten, so a subsequent put of the same key
+    is enqueued as a new task.
+    """
+
+    def __init__(self, maxsize: int = 0, *, key: Callable[[T], Hashable]) -> None:
+        self._key_func = key
+        super().__init__(maxsize)
+
+    def _init(self, maxsize: int) -> None:
+        self._queue: deque[_KeyedSlot[T]] = deque()
+        self._key_slots: dict[Hashable, _KeyedSlot[T]] = {}
+
+    def _merge(self, item: T) -> bool:
+        # Compute the key before touching any state: if the key function
+        # fails the queue is left unchanged.
+        key = self._key_func(item)
+        slot = self._key_slots.get(key)
+        if slot is None:
+            return False
+        slot.item = item
+        return True
+
+    def _put(self, item: T) -> None:
+        key = self._key_func(item)
+        slot = _KeyedSlot(key, item)
+        self._key_slots[key] = slot
+        self._queue.append(slot)
+
+    def _get(self) -> T:
+        slot = self._queue.popleft()
+        if self._key_slots.get(slot.key) is slot:
+            del self._key_slots[slot.key]
+        return slot.item

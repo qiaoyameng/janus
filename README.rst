@@ -29,11 +29,12 @@ follows `asyncio queue design
 Usage
 =====
 
-Three queues are available:
+Four queues are available:
 
 * ``Queue``
 * ``LifoQueue``
 * ``PriorityQueue``
+* ``KeyedQueue``
 
 Each has two properties: ``sync_q`` and ``async_q``.
 
