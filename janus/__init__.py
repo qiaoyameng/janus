@@ -8,7 +8,7 @@ from heapq import heappop, heappush
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
 from time import monotonic
-from typing import Callable, Generic, Optional, Protocol, TypeVar
+from typing import Any, Callable, Generic, Optional, Protocol, TypeVar
 
 if sys.version_info >= (3, 13):
     from asyncio import QueueShutDown as AsyncQueueShutDown
@@ -28,6 +28,7 @@ else:
 __version__ = "2.0.0"
 __all__ = (
     "Queue",
+    "KeyedQueue",
     "PriorityQueue",
     "LifoQueue",
     "SyncQueue",
@@ -239,6 +240,13 @@ class Queue(Generic[T]):
         self._put(item)
         self._unfinished_tasks += 1
 
+    def _try_merge(self, item: T) -> bool:
+        # Hook for keyed queues: merge the item into a still-pending entry
+        # with an equal key and return True, meaning no free slot and no
+        # new unfinished task are needed.  Plain queues never merge.
+        # Called with the sync mutex held, after the shutdown check.
+        return False
+
     async def _do_async_notifier(self, method: Callable[[], None]) -> None:
         async with self._async_mutex:
             method()
@@ -370,6 +378,8 @@ class _SyncQueueProxy(SyncQueue[T]):
         with parent._sync_not_full:
             if parent._is_shutdown:
                 raise SyncQueueShutDown
+            if parent._try_merge(item):
+                return
             if parent._maxsize > 0:
                 if not block:
                     if parent._qsize() >= parent._maxsize:
@@ -546,6 +556,8 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 if parent._is_shutdown:
                     raise AsyncQueueShutDown
                 parent._get_loop()  # check the event loop
+                if parent._try_merge(item):
+                    return
                 while 0 < parent._maxsize <= parent._qsize():
                     parent._async_not_full_waiting += 1
                     parent._sync_mutex.release()
@@ -574,6 +586,8 @@ class _AsyncQueueProxy(AsyncQueue[T]):
                 raise AsyncQueueShutDown
 
             parent._get_loop()
+            if parent._try_merge(item):
+                return
             if 0 < parent._maxsize <= parent._qsize():
                 raise AsyncQueueFull
 
@@ -694,6 +708,59 @@ class _AsyncQueueProxy(AsyncQueue[T]):
         for async one.
         """
         self._parent.shutdown(immediate)
+
+
+class KeyedQueue(Queue[T]):
+    """Variant of Queue that merges pending items with equal keys.
+
+    The `key` function maps an item to its identity key.  When an item is
+    put while another item with an equal key is still waiting in the queue,
+    the pending item is replaced in place: the new value keeps the original
+    queue position and no new unfinished task is counted.  Items already
+    retrieved by a consumer no longer participate in merging, so putting
+    the same key again appends a new entry (and a new task) at the tail.
+
+    Replacing an existing key never requires a free slot, so it succeeds
+    even on a full queue; adding a new key follows the regular blocking
+    rules of both the sync and the async API.  If the `key` function raises,
+    the queue is left unchanged.
+    """
+
+    def __init__(self, maxsize: int = 0, *, key: Callable[[T], Any]) -> None:
+        self._key_func = key
+        super().__init__(maxsize)
+
+    def _init(self, maxsize: int) -> None:
+        # Entries are [key, item] holders so that a pending value can be
+        # replaced in place, keeping the key's original queue position.
+        self._queue: deque[list[Any]] = deque()
+        self._key_map: dict[Any, list[Any]] = {}
+
+    def _try_merge(self, item: T) -> bool:
+        key = self._key_func(item)
+        holder = self._key_map.get(key)
+        if holder is None:
+            return False
+        holder[1] = item
+        return True
+
+    def _put_internal(self, item: T) -> None:
+        key = self._key_func(item)
+        holder = self._key_map.get(key)
+        if holder is not None:
+            # Another put registered the key while this put was waiting
+            # for a free slot; merge instead of appending a duplicate.
+            holder[1] = item
+            return
+        holder = [key, item]
+        self._key_map[key] = holder
+        self._queue.append(holder)
+        self._unfinished_tasks += 1
+
+    def _get(self) -> T:
+        holder = self._queue.popleft()
+        del self._key_map[holder[0]]
+        return holder[1]
 
 
 class PriorityQueue(Queue[T]):
