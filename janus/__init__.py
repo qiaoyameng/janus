@@ -3,12 +3,13 @@ import sys
 import threading
 from asyncio import QueueEmpty as AsyncQueueEmpty
 from asyncio import QueueFull as AsyncQueueFull
+from collections.abc import Sequence as SequenceABC
 from collections import deque
 from heapq import heappop, heappush
 from queue import Empty as SyncQueueEmpty
 from queue import Full as SyncQueueFull
 from time import monotonic
-from typing import Callable, Generic, Optional, Protocol, TypeVar
+from typing import Callable, Generic, Optional, Protocol, Sequence, TypeVar
 
 if sys.version_info >= (3, 13):
     from asyncio import QueueShutDown as AsyncQueueShutDown
@@ -46,6 +47,36 @@ T = TypeVar("T")
 OptFloat = Optional[float]
 
 
+def _is_sequence(value: object) -> bool:
+    return isinstance(value, SequenceABC) and not isinstance(
+        value, (str, bytes, bytearray)
+    )
+
+
+def _validate_many_items(items: object) -> Sequence[T]:
+    if not _is_sequence(items):
+        raise TypeError("put_many() expects a bounded sequence")
+    return tuple(items)
+
+
+def _validate_get_many_args(
+    min_items: int, max_items: Optional[int]
+) -> tuple[int, int]:
+    if isinstance(min_items, bool) or not isinstance(min_items, int) or min_items <= 0:
+        raise ValueError("min_items must be a positive integer")
+    if max_items is None:
+        max_items = min_items
+    elif (
+        isinstance(max_items, bool)
+        or not isinstance(max_items, int)
+        or max_items <= 0
+    ):
+        raise ValueError("max_items must be a positive integer")
+    if min_items > max_items:
+        raise ValueError("min_items must be less than or equal to max_items")
+    return min_items, max_items
+
+
 class BaseQueue(Protocol[T]):
     @property
     def maxsize(self) -> int: ...
@@ -66,7 +97,16 @@ class BaseQueue(Protocol[T]):
 
     def put_nowait(self, item: T) -> None: ...
 
+    def put_many_nowait(self, items: Sequence[T]) -> None: ...
+
     def get_nowait(self) -> T: ...
+
+    def get_many_nowait(
+        self,
+        min_items: int,
+        max_items: Optional[int] = ...,
+        tail_batch: bool = ...,
+    ) -> Sequence[T]: ...
 
     def shutdown(self, immediate: bool = False) -> None: ...
 
@@ -75,7 +115,23 @@ class SyncQueue(BaseQueue[T], Protocol[T]):
 
     def put(self, item: T, block: bool = True, timeout: OptFloat = None) -> None: ...
 
+    def put_many(
+        self,
+        items: Sequence[T],
+        block: bool = True,
+        timeout: OptFloat = None,
+    ) -> None: ...
+
     def get(self, block: bool = True, timeout: OptFloat = None) -> T: ...
+
+    def get_many(
+        self,
+        min_items: int,
+        max_items: Optional[int] = ...,
+        block: bool = ...,
+        timeout: OptFloat = ...,
+        tail_batch: bool = ...,
+    ) -> Sequence[T]: ...
 
     def join(self) -> None: ...
 
@@ -83,7 +139,13 @@ class SyncQueue(BaseQueue[T], Protocol[T]):
 class AsyncQueue(BaseQueue[T], Protocol[T]):
     async def put(self, item: T) -> None: ...
 
+    async def put_many(self, items: Sequence[T]) -> None: ...
+
     async def get(self) -> T: ...
+
+    async def get_many(
+        self, min_items: int, max_items: Optional[int] = ..., tail_batch: bool = ...
+    ) -> Sequence[T]: ...
 
     async def join(self) -> None: ...
 
@@ -238,6 +300,36 @@ class Queue(Generic[T]):
     def _put_internal(self, item: T) -> None:
         self._put(item)
         self._unfinished_tasks += 1
+
+    def _put_many_internal(self, items: Sequence[T]) -> None:
+        original = list(self._queue)
+        staged = deque(original)
+        self._queue = staged
+        try:
+            for item in items:
+                self._put(item)
+        except Exception:
+            self._queue = deque(original)
+            raise
+        self._queue = staged
+        self._unfinished_tasks += len(items)
+
+    def _get_many_internal(self, min_items: int, max_items: int) -> Sequence[T]:
+        count = min(max_items, self._qsize())
+        if count < min_items:
+            return []
+        original = list(self._queue)
+        staged = deque(original)
+        self._queue = staged
+        items = []
+        try:
+            for _ in range(count):
+                items.append(self._get())
+        except Exception:
+            self._queue = deque(original)
+            raise
+        self._queue = staged
+        return items
 
     async def _do_async_notifier(self, method: Callable[[], None]) -> None:
         async with self._async_mutex:
@@ -400,9 +492,57 @@ class _SyncQueueProxy(SyncQueue[T]):
                             raise SyncQueueShutDown
             parent._put_internal(item)
             if parent._sync_not_empty_waiting:
-                parent._sync_not_empty.notify()
+                parent._sync_not_empty.notify_all()
             if parent._async_not_empty_waiting:
-                parent._notify_async(parent._async_not_empty.notify)
+                parent._notify_async(parent._async_not_empty.notify_all)
+
+    def put_many(
+        self,
+        items: Sequence[T],
+        block: bool = True,
+        timeout: OptFloat = None,
+    ) -> None:
+        """Atomically put a bounded sequence of items into the queue."""
+        parent = self._parent
+        items = _validate_many_items(items)
+        with parent._sync_not_full:
+            if parent._is_shutdown:
+                raise SyncQueueShutDown
+            if parent._maxsize > 0 and len(items) > parent._maxsize:
+                raise ValueError("batch is larger than the queue capacity")
+            if parent._maxsize > 0:
+                if not block:
+                    if parent._qsize() + len(items) > parent._maxsize:
+                        raise SyncQueueFull
+                elif timeout is None:
+                    while parent._qsize() + len(items) > parent._maxsize:
+                        parent._sync_not_full_waiting += 1
+                        try:
+                            parent._sync_not_full.wait()
+                        finally:
+                            parent._sync_not_full_waiting -= 1
+                        if parent._is_shutdown:
+                            raise SyncQueueShutDown
+                elif timeout < 0:
+                    raise ValueError("'timeout' must be a non-negative number")
+                else:
+                    endtime = monotonic() + timeout
+                    while parent._qsize() + len(items) > parent._maxsize:
+                        remaining = endtime - monotonic()
+                        if remaining <= 0.0:
+                            raise SyncQueueFull
+                        parent._sync_not_full_waiting += 1
+                        try:
+                            parent._sync_not_full.wait(remaining)
+                        finally:
+                            parent._sync_not_full_waiting -= 1
+                        if parent._is_shutdown:
+                            raise SyncQueueShutDown
+            parent._put_many_internal(items)
+            if parent._sync_not_empty_waiting:
+                parent._sync_not_empty.notify_all()
+            if parent._async_not_empty_waiting:
+                parent._notify_async(parent._async_not_empty.notify_all)
 
     def get(self, block: bool = True, timeout: OptFloat = None) -> T:
         """Remove and return an item from the queue.
@@ -448,10 +588,81 @@ class _SyncQueueProxy(SyncQueue[T]):
                         raise SyncQueueShutDown
             item = parent._get()
             if parent._sync_not_full_waiting:
-                parent._sync_not_full.notify()
+                parent._sync_not_full.notify_all()
             if parent._async_not_full_waiting:
-                parent._notify_async(parent._async_not_full.notify)
+                parent._notify_async(parent._async_not_full.notify_all)
             return item
+
+    def get_many(
+        self,
+        min_items: int,
+        max_items: Optional[int] = None,
+        block: bool = True,
+        timeout: OptFloat = None,
+        tail_batch: bool = False,
+    ) -> Sequence[T]:
+        """Atomically remove between min_items and max_items items."""
+        parent = self._parent
+        min_items, max_items = _validate_get_many_args(min_items, max_items)
+        with parent._sync_not_empty:
+            if parent._is_shutdown and not parent._qsize():
+                raise SyncQueueShutDown
+            if not block:
+                if parent._qsize() < min_items:
+                    if tail_batch and parent._qsize():
+                        items = parent._get_many_internal(1, max_items)
+                        self._notify_not_full_after_get()
+                        return items
+                    if parent._is_shutdown:
+                        raise SyncQueueShutDown
+                    raise SyncQueueEmpty
+            elif timeout is None:
+                while parent._qsize() < min_items:
+                    if tail_batch and parent._is_shutdown and parent._qsize():
+                        items = parent._get_many_internal(1, max_items)
+                        self._notify_not_full_after_get()
+                        return items
+                    if parent._is_shutdown:
+                        raise SyncQueueShutDown
+                    parent._sync_not_empty_waiting += 1
+                    try:
+                        parent._sync_not_empty.wait()
+                    finally:
+                        parent._sync_not_empty_waiting -= 1
+                    if parent._is_shutdown and not parent._qsize():
+                        raise SyncQueueShutDown
+            elif timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number")
+            else:
+                endtime = monotonic() + timeout
+                while parent._qsize() < min_items:
+                    if tail_batch and parent._is_shutdown and parent._qsize():
+                        items = parent._get_many_internal(1, max_items)
+                        self._notify_not_full_after_get()
+                        return items
+                    if parent._is_shutdown:
+                        raise SyncQueueShutDown
+                    remaining = endtime - monotonic()
+                    if remaining <= 0.0:
+                        raise SyncQueueEmpty
+                    parent._sync_not_empty_waiting += 1
+                    try:
+                        parent._sync_not_empty.wait(remaining)
+                    finally:
+                        parent._sync_not_empty_waiting -= 1
+                    if parent._is_shutdown and not parent._qsize():
+                        raise SyncQueueShutDown
+
+            items = parent._get_many_internal(min_items, max_items)
+            self._notify_not_full_after_get()
+            return items
+
+    def _notify_not_full_after_get(self) -> None:
+        parent = self._parent
+        if parent._sync_not_full_waiting:
+            parent._sync_not_full.notify_all()
+        if parent._async_not_full_waiting:
+            parent._notify_async(parent._async_not_full.notify_all)
 
     def put_nowait(self, item: T) -> None:
         """Put an item into the queue without blocking.
@@ -461,6 +672,10 @@ class _SyncQueueProxy(SyncQueue[T]):
         """
         return self.put(item, block=False)
 
+    def put_many_nowait(self, items: Sequence[T]) -> None:
+        """Put a sequence into the queue without blocking."""
+        return self.put_many(items, block=False)
+
     def get_nowait(self) -> T:
         """Remove and return an item from the queue without blocking.
 
@@ -468,6 +683,17 @@ class _SyncQueueProxy(SyncQueue[T]):
         raise the Empty exception.
         """
         return self.get(block=False)
+
+    def get_many_nowait(
+        self,
+        min_items: int,
+        max_items: Optional[int] = None,
+        tail_batch: bool = False,
+    ) -> Sequence[T]:
+        """Remove a sequence from the queue without blocking."""
+        return self.get_many(
+            min_items, max_items, block=False, tail_batch=tail_batch
+        )
 
     def shutdown(self, immediate: bool = False) -> None:
         """Shut-down the queue, making queue gets and puts raise an exception.
@@ -559,9 +785,37 @@ class _AsyncQueueProxy(AsyncQueue[T]):
 
                 parent._put_internal(item)
                 if parent._async_not_empty_waiting:
-                    parent._async_not_empty.notify()
+                    parent._async_not_empty.notify_all()
                 if parent._sync_not_empty_waiting:
-                    parent._sync_not_empty.notify()
+                    parent._sync_not_empty.notify_all()
+
+    async def put_many(self, items: Sequence[T]) -> None:
+        """Atomically put a bounded sequence of items into the queue."""
+        parent = self._parent
+        items = _validate_many_items(items)
+        async with parent._async_not_full:
+            with parent._sync_mutex:
+                if parent._is_shutdown:
+                    raise AsyncQueueShutDown
+                parent._get_loop()
+                if parent._maxsize > 0 and len(items) > parent._maxsize:
+                    raise ValueError("batch is larger than the queue capacity")
+                while parent._qsize() + len(items) > parent._maxsize > 0:
+                    parent._async_not_full_waiting += 1
+                    parent._sync_mutex.release()
+                    try:
+                        await parent._async_not_full.wait()
+                    finally:
+                        parent._sync_mutex.acquire()
+                        parent._async_not_full_waiting -= 1
+                    if parent._is_shutdown:
+                        raise AsyncQueueShutDown
+
+                parent._put_many_internal(items)
+                if parent._async_not_empty_waiting:
+                    parent._async_not_empty.notify_all()
+                if parent._sync_not_empty_waiting:
+                    parent._sync_not_empty.notify_all()
 
     def put_nowait(self, item: T) -> None:
         """Put an item into the queue without blocking.
@@ -579,9 +833,29 @@ class _AsyncQueueProxy(AsyncQueue[T]):
 
             parent._put_internal(item)
             if parent._async_not_empty_waiting:
-                parent._notify_async(parent._async_not_empty.notify)
+                parent._notify_async(parent._async_not_empty.notify_all)
             if parent._sync_not_empty_waiting:
-                parent._sync_not_empty.notify()
+                parent._sync_not_empty.notify_all()
+
+    def put_many_nowait(self, items: Sequence[T]) -> None:
+        """Put a sequence into the queue without blocking."""
+        parent = self._parent
+        items = _validate_many_items(items)
+        with parent._sync_mutex:
+            if parent._is_shutdown:
+                raise AsyncQueueShutDown
+
+            parent._get_loop()
+            if parent._maxsize > 0 and len(items) > parent._maxsize:
+                raise ValueError("batch is larger than the queue capacity")
+            if parent._qsize() + len(items) > parent._maxsize > 0:
+                raise AsyncQueueFull
+
+            parent._put_many_internal(items)
+            if parent._async_not_empty_waiting:
+                parent._notify_async(parent._async_not_empty.notify_all)
+            if parent._sync_not_empty_waiting:
+                parent._sync_not_empty.notify_all()
 
     async def get(self) -> T:
         """Remove and return an item from the queue.
@@ -609,10 +883,45 @@ class _AsyncQueueProxy(AsyncQueue[T]):
 
                 item = parent._get()
                 if parent._async_not_full_waiting:
-                    parent._async_not_full.notify()
+                    parent._async_not_full.notify_all()
                 if parent._sync_not_full_waiting:
-                    parent._sync_not_full.notify()
+                    parent._sync_not_full.notify_all()
                 return item
+
+    async def get_many(
+        self,
+        min_items: int,
+        max_items: Optional[int] = None,
+        tail_batch: bool = False,
+    ) -> Sequence[T]:
+        """Atomically remove between min_items and max_items items."""
+        parent = self._parent
+        min_items, max_items = _validate_get_many_args(min_items, max_items)
+        async with parent._async_not_empty:
+            with parent._sync_mutex:
+                if parent._is_shutdown and not parent._qsize():
+                    raise AsyncQueueShutDown
+                parent._get_loop()
+                while parent._qsize() < min_items:
+                    if tail_batch and parent._is_shutdown and parent._qsize():
+                        items = parent._get_many_internal(1, max_items)
+                        self._notify_not_full_after_get()
+                        return items
+                    if parent._is_shutdown:
+                        raise AsyncQueueShutDown
+                    parent._async_not_empty_waiting += 1
+                    parent._sync_mutex.release()
+                    try:
+                        await parent._async_not_empty.wait()
+                    finally:
+                        parent._sync_mutex.acquire()
+                        parent._async_not_empty_waiting -= 1
+                    if parent._is_shutdown and not parent._qsize():
+                        raise AsyncQueueShutDown
+
+                items = parent._get_many_internal(min_items, max_items)
+                self._notify_not_full_after_get()
+                return items
 
     def get_nowait(self) -> T:
         """Remove and return an item from the queue.
@@ -629,10 +938,43 @@ class _AsyncQueueProxy(AsyncQueue[T]):
             parent._get_loop()
             item = parent._get()
             if parent._async_not_full_waiting:
-                parent._notify_async(parent._async_not_full.notify)
+                parent._notify_async(parent._async_not_full.notify_all)
             if parent._sync_not_full_waiting:
-                parent._sync_not_full.notify()
+                parent._sync_not_full.notify_all()
             return item
+
+    def get_many_nowait(
+        self,
+        min_items: int,
+        max_items: Optional[int] = None,
+        tail_batch: bool = False,
+    ) -> Sequence[T]:
+        """Remove a sequence from the queue without blocking."""
+        parent = self._parent
+        min_items, max_items = _validate_get_many_args(min_items, max_items)
+        with parent._sync_mutex:
+            if parent._is_shutdown and not parent._qsize():
+                raise AsyncQueueShutDown
+            if parent._qsize() < min_items:
+                if tail_batch and parent._qsize():
+                    items = parent._get_many_internal(1, max_items)
+                    self._notify_not_full_after_get()
+                    return items
+                if parent._is_shutdown:
+                    raise AsyncQueueShutDown
+                raise AsyncQueueEmpty
+
+            parent._get_loop()
+            items = parent._get_many_internal(min_items, max_items)
+            self._notify_not_full_after_get()
+            return items
+
+    def _notify_not_full_after_get(self) -> None:
+        parent = self._parent
+        if parent._async_not_full_waiting:
+            parent._async_not_full.notify_all()
+        if parent._sync_not_full_waiting:
+            parent._sync_not_full.notify_all()
 
     def task_done(self) -> None:
         """Indicate that a formerly enqueued task is complete.
@@ -716,6 +1058,32 @@ class PriorityQueue(Queue[T]):
     def _get(self) -> T:
         return heappop(self._heap_queue)
 
+    def _put_many_internal(self, items: Sequence[T]) -> None:
+        original = self._heap_queue
+        staged = list(original)
+        try:
+            for item in items:
+                heappush(staged, item)
+        except Exception:
+            self._heap_queue = original
+            raise
+        self._heap_queue = staged
+        self._unfinished_tasks += len(items)
+
+    def _get_many_internal(self, min_items: int, max_items: int) -> Sequence[T]:
+        count = min(max_items, self._qsize())
+        if count < min_items:
+            return []
+        original = self._heap_queue
+        staged = list(original)
+        try:
+            items = [heappop(staged) for _ in range(count)]
+        except Exception:
+            self._heap_queue = original
+            raise
+        self._heap_queue = staged
+        return items
+
 
 class LifoQueue(Queue[T]):
     """Variant of Queue that retrieves most recently added entries first."""
@@ -728,3 +1096,33 @@ class LifoQueue(Queue[T]):
 
     def _get(self) -> T:
         return self._queue.pop()
+
+    def _put_many_internal(self, items: Sequence[T]) -> None:
+        original = self._queue
+        staged = deque(original)
+        self._queue = staged
+        try:
+            for item in items:
+                self._put(item)
+        except Exception:
+            self._queue = original
+            raise
+        self._queue = staged
+        self._unfinished_tasks += len(items)
+
+    def _get_many_internal(self, min_items: int, max_items: int) -> Sequence[T]:
+        count = min(max_items, self._qsize())
+        if count < min_items:
+            return []
+        original = self._queue
+        staged = deque(original)
+        self._queue = staged
+        items = []
+        try:
+            for _ in range(count):
+                items.append(self._get())
+        except Exception:
+            self._queue = original
+            raise
+        self._queue = staged
+        return items
